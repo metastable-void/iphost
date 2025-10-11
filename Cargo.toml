@@ -1,0 +1,19 @@
+[package]
+name = "iphost"
+version = "0.1.0"
+edition = "2024"
+
+authors = ["Menhera.org Developers"]
+description = "Stable hostname resolution library that supports storing a hostname in either a static IP addresses or an FQDN."
+license = "Apache-2.0 OR MPL-2.0"
+readme = "README.md"
+repository = "https://github.com/metastable-void/iphost"
+homepage = "https://github.com/metastable-void/iphost"
+
+[features]
+default = ["serde"]
+serde = ["dep:serde"]
+
+[dependencies]
+fqdn = { version = "0.4.6", features = ["domain-label-length-limited-to-63", "domain-name-length-limited-to-255", "domain-name-without-special-chars", "domain-label-cannot-start-or-end-with-hyphen", "punycode"] }
+serde = { version = "1", features = ["derive"], optional = true }
