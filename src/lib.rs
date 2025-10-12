@@ -1,10 +1,9 @@
-
 mod auto;
 
 use std::fmt::Display;
+pub(crate) use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs};
 use std::str::FromStr;
-use std::sync::{atomic::AtomicBool, Arc, RwLock};
-pub(crate) use std::net::{Ipv4Addr, Ipv6Addr, IpAddr, SocketAddr, ToSocketAddrs};
+use std::sync::{Arc, RwLock, atomic::AtomicBool};
 
 pub use auto::AutoIpHostResolver;
 pub use fqdn::FQDN;
@@ -50,9 +49,9 @@ impl FromStr for IpHost {
 #[cfg(feature = "serde")]
 mod serialization {
     use super::*;
-    use std::fmt;
-    use serde::de::{self, Visitor, Deserialize, Deserializer};
+    use serde::de::{self, Deserialize, Deserializer, Visitor};
     use serde::ser::{Serialize, Serializer};
+    use std::fmt;
 
     struct IpHostVisitor;
 
@@ -63,8 +62,9 @@ mod serialization {
         }
 
         fn visit_str<E>(self, v: &str) -> Result<Self::Value, E>
-            where
-                E: de::Error, {
+        where
+            E: de::Error,
+        {
             if let Ok(addr) = v.parse::<Ipv4Addr>() {
                 Ok(IpHost::V4Addr(addr))
             } else if let Ok(addr) = v.parse::<Ipv6Addr>() {
@@ -72,7 +72,10 @@ mod serialization {
             } else if let Ok(fqdn) = v.parse::<FQDN>() {
                 Ok(IpHost::Fqdn(fqdn))
             } else {
-                Err(E::invalid_value(de::Unexpected::Str(v), &"IP address or FQDN"))
+                Err(E::invalid_value(
+                    de::Unexpected::Str(v),
+                    &"IP address or FQDN",
+                ))
             }
         }
     }
@@ -88,8 +91,9 @@ mod serialization {
 
     impl Serialize for IpHost {
         fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-            where
-                S: Serializer {
+        where
+            S: Serializer,
+        {
             serializer.serialize_str(&self.to_string())
         }
     }
@@ -108,12 +112,16 @@ pub struct IpHostResolver {
 
 impl IpHostResolver {
     /// Creates a new resolver instance for a particular hostname. (no-op for IP addresses)
-    /// 
+    ///
     /// This method accepts options about what to do on error conditions.
-    /// 
+    ///
     /// - `use_cached_on_error`: whether to use cached results when a resolution error occurs.
     /// - `retain_stale_values`: whether to keep cached results when the resolution results in an empty address set.
-    pub fn new_with_config(ip_host: IpHost, use_cached_on_error: bool, retain_stale_values: bool) -> Self {
+    pub fn new_with_config(
+        ip_host: IpHost,
+        use_cached_on_error: bool,
+        retain_stale_values: bool,
+    ) -> Self {
         let v4_addr = if let IpHost::V4Addr(addr) = &ip_host {
             Some(*addr)
         } else {
@@ -137,9 +145,9 @@ impl IpHostResolver {
     }
 
     /// Creates a new resolver instance for a particular hostname. (no-op for IP addresses)
-    /// 
+    ///
     /// This method uses the following default values.
-    /// 
+    ///
     /// - `use_cached_on_error`: `true`
     /// - `retain_stale_values`: `false`
     pub fn new(ip_host: IpHost) -> Self {
@@ -165,23 +173,27 @@ impl IpHostResolver {
     }
 
     fn do_transaction<T, F: FnOnce() -> T>(&self, op: F) -> Option<T> {
-        if self.is_locked.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        if self
+            .is_locked
+            .swap(true, std::sync::atomic::Ordering::SeqCst)
+        {
             return None;
         }
 
         let ret = op();
 
-        self.is_locked.store(false, std::sync::atomic::Ordering::SeqCst);
+        self.is_locked
+            .store(false, std::sync::atomic::Ordering::SeqCst);
         Some(ret)
     }
 
     /// Atomically replaces the hostname value.
-    /// 
+    ///
     /// Returns Ok(old_val) if the swap succeeds, and
     /// returns Err(new_val) if the swap fails (there is some concurrent transaction).
-    /// 
+    ///
     /// When the new value is equal to the old value, this returns Ok(val).
-    /// 
+    ///
     /// This MAY block the calling thread.
     pub fn replace_ip_host(&self, new: IpHost) -> Result<IpHost, IpHost> {
         let v4_addr = if let IpHost::V4Addr(addr) = &new {
@@ -238,71 +250,76 @@ impl IpHostResolver {
     }
 
     /// Resolves the hostname, refreshes the stored values, and returns all resolved IP addresses.
-    /// 
+    ///
     /// This WILL block the calling thread.
     #[inline]
     pub fn resolve(&self) -> Vec<IpAddr> {
-        let ret = self.do_transaction(|| {
-            let prev_v4 = self.ipv4_addr();
-            let prev_v6 = self.ipv6_addr();
+        let ret = self
+            .do_transaction(|| {
+                let prev_v4 = self.ipv4_addr();
+                let prev_v6 = self.ipv6_addr();
 
-            let host = if let Ok(lock) = self.ip_host.read() {
-                lock.clone()
-            } else {
-                return None;
-            };
+                let host = if let Ok(lock) = self.ip_host.read() {
+                    lock.clone()
+                } else {
+                    return None;
+                };
 
-            let fqdn = match host {
-                IpHost::V4Addr(addr) => return Some(vec![IpAddr::V4(addr)]),
-                IpHost::V6Addr(addr) => return Some(vec![IpAddr::V6(addr)]),
-                IpHost::Fqdn(fqdn) => fqdn,
-            };
+                let fqdn = match host {
+                    IpHost::V4Addr(addr) => return Some(vec![IpAddr::V4(addr)]),
+                    IpHost::V6Addr(addr) => return Some(vec![IpAddr::V6(addr)]),
+                    IpHost::Fqdn(fqdn) => fqdn,
+                };
 
-            let ret = (fqdn.to_string(), 0).to_socket_addrs().ok().map(|ok| ok.map(|a| match a {
-                SocketAddr::V4(addr) => IpAddr::V4(*addr.ip()),
-                SocketAddr::V6(addr) => IpAddr::V6(*addr.ip()),
-            }).collect());
+                let ret = (fqdn.to_string(), 0).to_socket_addrs().ok().map(|ok| {
+                    ok.map(|a| match a {
+                        SocketAddr::V4(addr) => IpAddr::V4(*addr.ip()),
+                        SocketAddr::V6(addr) => IpAddr::V6(*addr.ip()),
+                    })
+                    .collect()
+                });
 
-            let ret: Vec<IpAddr> = if let Some(r) = ret {
-                r
-            } else {
-                return None;
-            };
+                let ret: Vec<IpAddr> = if let Some(r) = ret {
+                    r
+                } else {
+                    return None;
+                };
 
-            let mut v4_cand = None;
-            let mut v6_cand = None;
-            // Stable resolution (if the same address as before is available, use that)
-            for addr in ret.iter() {
-                match *addr {
-                    IpAddr::V4(addr) => {
-                        if prev_v4 == Some(addr) {
-                            v4_cand = Some(addr);
-                        } else if v4_cand.is_none() {
-                            v4_cand = Some(addr);
+                let mut v4_cand = None;
+                let mut v6_cand = None;
+                // Stable resolution (if the same address as before is available, use that)
+                for addr in ret.iter() {
+                    match *addr {
+                        IpAddr::V4(addr) => {
+                            if prev_v4 == Some(addr) {
+                                v4_cand = Some(addr);
+                            } else if v4_cand.is_none() {
+                                v4_cand = Some(addr);
+                            }
                         }
-                    },
-                    IpAddr::V6(addr) => {
-                        if prev_v6 == Some(addr) {
-                            v6_cand = Some(addr);
-                        } else if v6_cand.is_none() {
-                            v6_cand = Some(addr);
+                        IpAddr::V6(addr) => {
+                            if prev_v6 == Some(addr) {
+                                v6_cand = Some(addr);
+                            } else if v6_cand.is_none() {
+                                v6_cand = Some(addr);
+                            }
                         }
                     }
                 }
-            }
 
-            if v4_cand.is_some() || !*self.retain_stale_values {
-                if let Ok(mut lock) = self.prev_v4_addr.write() {
-                    *lock = v4_cand;
+                if v4_cand.is_some() || !*self.retain_stale_values {
+                    if let Ok(mut lock) = self.prev_v4_addr.write() {
+                        *lock = v4_cand;
+                    }
                 }
-            }
-            if v6_cand.is_some() || !*self.retain_stale_values {
-                if let Ok(mut lock) = self.prev_v6_addr.write() {
-                    *lock = v6_cand;
+                if v6_cand.is_some() || !*self.retain_stale_values {
+                    if let Ok(mut lock) = self.prev_v6_addr.write() {
+                        *lock = v6_cand;
+                    }
                 }
-            }
-            Some(ret)
-        }).flatten();
+                Some(ret)
+            })
+            .flatten();
 
         if ret.is_none() && *self.use_cached_on_error {
             let mut values = Vec::with_capacity(2);
@@ -322,37 +339,43 @@ impl IpHostResolver {
     }
 
     /// Resolves the hostname, returning a separated pair of `Vec<Ipv4Addr>` and `Vec<Ipv6Addr>`.
-    /// 
+    ///
     /// This WILL block the calling thread.
     #[inline]
     pub fn resolve_v4_and_v6(&self) -> (Vec<Ipv4Addr>, Vec<Ipv6Addr>) {
         let addrs = self.resolve();
         let (v4iter, v6iter) = addrs.iter().partition::<Vec<_>, _>(|a| a.is_ipv4());
-        let v4addrs = v4iter.iter().map(|a| match a {
-            IpAddr::V4(addr) => *addr,
-            _ => unreachable!(),
-        }).collect::<Vec<_>>();
-        let v6addrs = v6iter.iter().map(|a| match a {
-            IpAddr::V6(addr) => *addr,
-            _ => unreachable!(),
-        }).collect::<Vec<_>>();
+        let v4addrs = v4iter
+            .iter()
+            .map(|a| match a {
+                IpAddr::V4(addr) => *addr,
+                _ => unreachable!(),
+            })
+            .collect::<Vec<_>>();
+        let v6addrs = v6iter
+            .iter()
+            .map(|a| match a {
+                IpAddr::V6(addr) => *addr,
+                _ => unreachable!(),
+            })
+            .collect::<Vec<_>>();
 
         (v4addrs, v6addrs)
     }
 
     /// Resolves the hostname to IPv4 addresses.
-    /// 
+    ///
     /// This WILL block the calling thread.
-    /// 
+    ///
     /// NOTE: Use resolve_v4_and_v6() if you want both IPv4 and IPv6 addresses.
     pub fn resolve_v4(&self) -> Vec<Ipv4Addr> {
         self.resolve_v4_and_v6().0
     }
 
     /// Resolves the hostname to IPv6 addresses.
-    /// 
+    ///
     /// This WILL block the calling thread.
-    /// 
+    ///
     /// NOTE: Use resolve_v4_and_v6() if you want both IPv4 and IPv6 addresses.
     pub fn resolve_v6(&self) -> Vec<Ipv6Addr> {
         self.resolve_v4_and_v6().1
@@ -366,11 +389,19 @@ mod tests {
     #[test]
     fn resolve_localhost() {
         let loopback = Ipv4Addr::new(127, 0, 0, 1);
-        let ip_host = "localhost".parse::<IpHost>()
+        let ip_host = "localhost"
+            .parse::<IpHost>()
             .expect("Failed to construct the IpHost struct");
         let resolver = IpHostResolver::new(ip_host);
         let v4_addrs = resolver.resolve_v4();
-        assert!(v4_addrs.contains(&loopback), "Failed to resolve `localhost`");
-        assert_eq!(resolver.ipv4_addr(), Some(loopback), "Cached value of `localhost` resolution did not contain 127.0.0.1");
+        assert!(
+            v4_addrs.contains(&loopback),
+            "Failed to resolve `localhost`"
+        );
+        assert_eq!(
+            resolver.ipv4_addr(),
+            Some(loopback),
+            "Cached value of `localhost` resolution did not contain 127.0.0.1"
+        );
     }
 }

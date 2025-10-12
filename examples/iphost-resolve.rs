@@ -1,4 +1,3 @@
-
 use iphost::{IpHost, IpHostResolver};
 
 fn main() {

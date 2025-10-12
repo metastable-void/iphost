@@ -1,8 +1,11 @@
-
-use std::{ops::Deref, sync::mpsc::{channel, Receiver, Sender, TryRecvError}, time::Duration};
+use std::{
+    ops::Deref,
+    sync::mpsc::{Receiver, Sender, TryRecvError, channel},
+    time::Duration,
+};
 
 /// Spawn a background thread to do hostname resolutions automatically.
-/// 
+///
 /// You can check the resolved values later after you started this.
 #[derive(Debug, Clone)]
 pub struct AutoIpHostResolver {
@@ -30,7 +33,7 @@ impl AutoIpHostResolver {
                 match on_drop_receiver.try_recv() {
                     Ok(_) => break,
                     Err(TryRecvError::Disconnected) => break,
-                    Err(_) => {},
+                    Err(_) => {}
                 }
                 #[allow(unused_variables)]
                 let res = inner_clone.resolve();

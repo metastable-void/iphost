@@ -1,7 +1,6 @@
-
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use iphost::{IpHost, AutoIpHostResolver};
+use iphost::{AutoIpHostResolver, IpHost};
 
 fn main() {
     let args = std::env::args().collect::<Vec<_>>();
@@ -26,7 +25,10 @@ fn main() {
         if new_ipv4 != ipv4 {
             println!(
                 "[{}] IPv4 changed: {:?}",
-                SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs(),
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs(),
                 new_ipv4,
             );
             ipv4 = new_ipv4;
@@ -36,7 +38,10 @@ fn main() {
         if new_ipv6 != ipv6 {
             println!(
                 "[{}] IPv6 changed: {:?}",
-                SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs(),
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs(),
                 new_ipv6,
             );
             ipv6 = new_ipv6;
