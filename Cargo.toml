@@ -1,6 +1,6 @@
 [package]
 name = "iphost"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 
 authors = ["Menhera.org Developers"]
@@ -11,9 +11,11 @@ repository = "https://github.com/metastable-void/iphost"
 homepage = "https://github.com/metastable-void/iphost"
 
 [features]
-default = ["serde"]
+default = ["serde", "tracing"]
 serde = ["dep:serde"]
+tracing = ["dep:tracing"]
 
 [dependencies]
+tracing = { version = "0.1", optional = true }
 fqdn = { version = "0.4.6", features = ["domain-label-length-limited-to-63", "domain-name-length-limited-to-255", "domain-name-without-special-chars", "domain-label-cannot-start-or-end-with-hyphen", "punycode"] }
 serde = { version = "1", features = ["derive"], optional = true }

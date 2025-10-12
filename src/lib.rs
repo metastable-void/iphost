@@ -1,10 +1,13 @@
 
+mod auto;
+
 use std::fmt::Display;
 use std::str::FromStr;
 use std::sync::{atomic::AtomicBool, Arc, RwLock};
 pub(crate) use std::net::{Ipv4Addr, Ipv6Addr, IpAddr, SocketAddr, ToSocketAddrs};
 
-pub(crate) use fqdn::FQDN;
+pub use auto::AutoIpHostResolver;
+pub use fqdn::FQDN;
 
 /// Representation for a hostname, either an IP address or an FQDN.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -93,11 +96,12 @@ mod serialization {
 }
 
 /// Resolver into IP addresses for a hostname.
+#[derive(Debug, Clone)]
 pub struct IpHostResolver {
     ip_host: Arc<RwLock<IpHost>>,
     prev_v4_addr: Arc<RwLock<Option<Ipv4Addr>>>,
     prev_v6_addr: Arc<RwLock<Option<Ipv6Addr>>>,
-    is_locked: AtomicBool,
+    is_locked: Arc<AtomicBool>,
     use_cached_on_error: Arc<bool>,
     retain_stale_values: Arc<bool>,
 }
@@ -126,7 +130,7 @@ impl IpHostResolver {
             ip_host: Arc::new(RwLock::new(ip_host)),
             prev_v4_addr: Arc::new(RwLock::new(v4_addr)),
             prev_v6_addr: Arc::new(RwLock::new(v6_addr)),
-            is_locked: AtomicBool::new(false),
+            is_locked: Arc::new(AtomicBool::new(false)),
             use_cached_on_error: Arc::new(use_cached_on_error),
             retain_stale_values: Arc::new(retain_stale_values),
         }
