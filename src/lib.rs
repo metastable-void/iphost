@@ -211,11 +211,10 @@ impl IpHostResolver {
         let new_clone = new.clone();
 
         let ret = self.do_transaction(|| {
-            if let Ok(lock) = self.ip_host.read() {
-                if *lock == new {
+            if let Ok(lock) = self.ip_host.read()
+                && *lock == new {
                     return Ok(new);
                 }
-            }
 
             let value = if let Ok(mut lock) = self.ip_host.write() {
                 let old = lock.clone();
@@ -279,11 +278,7 @@ impl IpHostResolver {
                     .collect()
                 });
 
-                let ret: Vec<IpAddr> = if let Some(r) = ret {
-                    r
-                } else {
-                    return None;
-                };
+                let ret: Vec<IpAddr> = ret?;
 
                 let mut v4_cand = None;
                 let mut v6_cand = None;
@@ -291,32 +286,26 @@ impl IpHostResolver {
                 for addr in ret.iter() {
                     match *addr {
                         IpAddr::V4(addr) => {
-                            if prev_v4 == Some(addr) {
-                                v4_cand = Some(addr);
-                            } else if v4_cand.is_none() {
+                            if prev_v4 == Some(addr) || v4_cand.is_none() {
                                 v4_cand = Some(addr);
                             }
                         }
                         IpAddr::V6(addr) => {
-                            if prev_v6 == Some(addr) {
-                                v6_cand = Some(addr);
-                            } else if v6_cand.is_none() {
+                            if prev_v6 == Some(addr) || v6_cand.is_none() {
                                 v6_cand = Some(addr);
                             }
                         }
                     }
                 }
 
-                if v4_cand.is_some() || !*self.retain_stale_values {
-                    if let Ok(mut lock) = self.prev_v4_addr.write() {
+                if (v4_cand.is_some() || !*self.retain_stale_values)
+                    && let Ok(mut lock) = self.prev_v4_addr.write() {
                         *lock = v4_cand;
                     }
-                }
-                if v6_cand.is_some() || !*self.retain_stale_values {
-                    if let Ok(mut lock) = self.prev_v6_addr.write() {
+                if (v6_cand.is_some() || !*self.retain_stale_values)
+                    && let Ok(mut lock) = self.prev_v6_addr.write() {
                         *lock = v6_cand;
                     }
-                }
                 Some(ret)
             })
             .flatten();
@@ -329,12 +318,9 @@ impl IpHostResolver {
             if let Some(addr) = self.ipv4_addr() {
                 values.push(IpAddr::V4(addr));
             }
-            return values;
+            values
         } else {
-            match ret {
-                Some(values) => values,
-                None => vec![],
-            }
+            ret.unwrap_or_default()
         }
     }
 
