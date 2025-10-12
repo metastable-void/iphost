@@ -5,7 +5,7 @@ pub(crate) use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs}
 use std::str::FromStr;
 use std::sync::{Arc, RwLock, atomic::AtomicBool};
 
-pub use auto::AutoIpHostResolver;
+pub use auto::*;
 pub use fqdn::FQDN;
 
 /// Representation for a hostname, either an IP address or an FQDN.
@@ -80,6 +80,7 @@ mod serialization {
         }
     }
 
+    #[cfg_attr(docsrs, doc(cfg(feature = "serde")))]
     impl<'de> Deserialize<'de> for IpHost {
         fn deserialize<D>(deserializer: D) -> Result<IpHost, D::Error>
         where
@@ -89,6 +90,7 @@ mod serialization {
         }
     }
 
+    #[cfg_attr(docsrs, doc(cfg(feature = "serde")))]
     impl Serialize for IpHost {
         fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
         where
