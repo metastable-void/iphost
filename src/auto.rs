@@ -1,6 +1,9 @@
 
 use std::{ops::Deref, sync::mpsc::{channel, Receiver, Sender, TryRecvError}, time::Duration};
 
+/// Spawn a background thread to do hostname resolutions automatically.
+/// 
+/// You can check the resolved values later after you started this.
 #[derive(Debug, Clone)]
 pub struct AutoIpHostResolver {
     inner: super::IpHostResolver,
