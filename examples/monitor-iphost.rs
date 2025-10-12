@@ -10,7 +10,8 @@ fn print_event(args: Arguments<'_>) {
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
-            .as_millis() as f64 / 1000.0f64,
+            .as_millis() as f64
+            / 1000.0f64,
         args.to_string(),
     );
 }
@@ -32,7 +33,10 @@ fn main() {
 
     let ip_host_clone = ip_host.clone();
 
-    print_event(format_args!("Monitoring address changes for hostname: {}", &ip_host));
+    print_event(format_args!(
+        "Monitoring address changes for hostname: {}",
+        &ip_host
+    ));
     let resolver = AutoIpHostResolver::new(ip_host, Duration::from_secs(1));
 
     #[cfg(not(feature = "broadcast"))]

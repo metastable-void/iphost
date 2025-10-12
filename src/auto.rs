@@ -1,11 +1,12 @@
 use std::{
-    net::{Ipv4Addr, Ipv6Addr}, time::Duration,
+    net::{Ipv4Addr, Ipv6Addr},
+    time::Duration,
 };
 
 use dropcatch::DropCatcher;
 
 #[cfg(feature = "broadcast")]
-use tokio::sync::{oneshot, broadcast};
+use tokio::sync::{broadcast, oneshot};
 
 #[cfg(not(feature = "broadcast"))]
 use std::sync::mpsc;
@@ -45,8 +46,6 @@ impl IpChanges {
     }
 }
 
-
-
 /// Spawn a background thread to do hostname resolutions automatically.
 ///
 /// You can check the resolved values later after you started this.
@@ -73,7 +72,7 @@ impl AutoIpHostResolver {
     }
 
     pub fn new(ip_host: super::IpHost, refresh_interval: Duration) -> Self {
-        #[cfg(not(feature = "broadcast"))]  
+        #[cfg(not(feature = "broadcast"))]
         let (tx, rx) = mpsc::channel();
 
         #[cfg(feature = "broadcast")]
@@ -93,11 +92,7 @@ impl AutoIpHostResolver {
         let bc_pub_clone = bc_pub.clone();
 
         let me = Self {
-            inner: super::IpHostResolver::new_with_config(
-                ip_host,
-                true,
-                false
-            ),
+            inner: super::IpHostResolver::new_with_config(ip_host, true, false),
             _on_drop: on_drop,
 
             #[cfg(feature = "broadcast")]
@@ -105,7 +100,7 @@ impl AutoIpHostResolver {
         };
 
         me.start_worker(
-            rx, 
+            rx,
             refresh_interval,
             #[cfg(feature = "broadcast")]
             bc_pub,
@@ -117,16 +112,13 @@ impl AutoIpHostResolver {
     fn start_worker(
         &self,
 
-        #[cfg(not(feature = "broadcast"))]
-        on_drop_receiver: mpsc::Receiver<()>,
+        #[cfg(not(feature = "broadcast"))] on_drop_receiver: mpsc::Receiver<()>,
 
-        #[cfg(feature = "broadcast")]
-        mut on_drop_receiver: oneshot::Receiver<()>,
+        #[cfg(feature = "broadcast")] mut on_drop_receiver: oneshot::Receiver<()>,
 
         interval: Duration,
 
-        #[cfg(feature = "broadcast")]
-        bc_pub: broadcast::Sender<IpChanges>,
+        #[cfg(feature = "broadcast")] bc_pub: broadcast::Sender<IpChanges>,
     ) {
         let inner_clone = self.inner.clone();
         std::thread::spawn(move || {
@@ -141,7 +133,7 @@ impl AutoIpHostResolver {
                 match on_drop_receiver.try_recv() {
                     Ok(_) => break,
                     Err(oneshot::error::TryRecvError::Closed) => break,
-                    Err(_) => {},
+                    Err(_) => {}
                 }
 
                 #[cfg(not(feature = "broadcast"))]
@@ -158,7 +150,6 @@ impl AutoIpHostResolver {
                 for ip in res {
                     tracing::trace!(resolved_ip = %ip, "Hostname resolved");
                 }
-
 
                 #[cfg(feature = "broadcast")]
                 {
@@ -209,7 +200,7 @@ impl AutoIpHostResolver {
                         let _ = bc_pub.send(change);
                     }
                 }
-                
+
                 std::thread::sleep(interval);
             }
 
@@ -221,10 +212,11 @@ impl AutoIpHostResolver {
     #[cfg(feature = "broadcast")]
     #[cfg_attr(docsrs, doc(cfg(feature = "broadcast")))]
     pub fn subscribe_changes(&self) -> IpHostSubscriber {
-        IpHostSubscriber { tx: self.bc_pub.clone() }
+        IpHostSubscriber {
+            tx: self.bc_pub.clone(),
+        }
     }
 }
-
 
 #[cfg(feature = "broadcast")]
 #[cfg_attr(docsrs, doc(cfg(feature = "broadcast")))]
@@ -236,7 +228,7 @@ pub struct IpHostSubscriber {
 #[cfg_attr(docsrs, doc(cfg(feature = "broadcast")))]
 impl IpHostSubscriber {
     /// Wait for next IP address changes, blocking the current thread.
-    /// 
+    ///
     /// This function is safe to be called from an async context, like `tokio::task::spawn_blocking()`.
     pub fn wait_for_change_blocking(&self) -> Option<IpChanges> {
         loop {
@@ -244,16 +236,14 @@ impl IpHostSubscriber {
 
             // We spawn a thread to make a call from an async context possible
             // (i.e. tokio::task::spawn_blocking()).
-            let join = std::thread::spawn(move || {
-                rx.blocking_recv()
-            }).join();
+            let join = std::thread::spawn(move || rx.blocking_recv()).join();
             let res = match join {
                 Ok(v) => v,
                 _ => {
                     #[cfg(feature = "tracing")]
                     tracing::error!("Event receiver thread panicked");
                     continue;
-                },
+                }
             };
 
             #[allow(unreachable_patterns)]
