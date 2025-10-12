@@ -1,4 +1,4 @@
-#![cfg_attr(docsrs, feature(doc_srs))]
+#![cfg_attr(docsrs, feature(doc_cfg))]
 
 mod auto;
 
