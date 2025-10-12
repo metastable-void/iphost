@@ -212,9 +212,10 @@ impl IpHostResolver {
 
         let ret = self.do_transaction(|| {
             if let Ok(lock) = self.ip_host.read()
-                && *lock == new {
-                    return Ok(new);
-                }
+                && *lock == new
+            {
+                return Ok(new);
+            }
 
             let value = if let Ok(mut lock) = self.ip_host.write() {
                 let old = lock.clone();
@@ -299,13 +300,15 @@ impl IpHostResolver {
                 }
 
                 if (v4_cand.is_some() || !*self.retain_stale_values)
-                    && let Ok(mut lock) = self.prev_v4_addr.write() {
-                        *lock = v4_cand;
-                    }
+                    && let Ok(mut lock) = self.prev_v4_addr.write()
+                {
+                    *lock = v4_cand;
+                }
                 if (v6_cand.is_some() || !*self.retain_stale_values)
-                    && let Ok(mut lock) = self.prev_v6_addr.write() {
-                        *lock = v6_cand;
-                    }
+                    && let Ok(mut lock) = self.prev_v6_addr.write()
+                {
+                    *lock = v6_cand;
+                }
                 Some(ret)
             })
             .flatten();
