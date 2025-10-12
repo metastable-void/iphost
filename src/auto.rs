@@ -82,7 +82,7 @@ impl AutoIpHostResolver {
         let (bc_pub, _) = broadcast::channel(16);
 
         let on_drop = DropCatcher::new(move || {
-            if let Err(_) = tx.send(()) {
+            if tx.send(()).is_err() {
                 #[cfg(feature = "tracing")]
                 tracing::warn!("Worker thread exited for some reason, before me");
             };
