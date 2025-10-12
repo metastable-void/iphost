@@ -1,3 +1,5 @@
+#![cfg_attr(docsrs, feature(doc_srs))]
+
 mod auto;
 
 use std::fmt::Display;

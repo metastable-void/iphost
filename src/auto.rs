@@ -218,6 +218,7 @@ impl AutoIpHostResolver {
     }
 }
 
+/// Subscriber to IP address changes.
 #[cfg(feature = "broadcast")]
 #[cfg_attr(docsrs, doc(cfg(feature = "broadcast")))]
 pub struct IpHostSubscriber {
@@ -228,6 +229,8 @@ pub struct IpHostSubscriber {
 #[cfg_attr(docsrs, doc(cfg(feature = "broadcast")))]
 impl IpHostSubscriber {
     /// Wait for next IP address changes, blocking the current thread.
+    /// 
+    /// Returns None if the resolver is dropped for some reason.
     ///
     /// This function is safe to be called from an async context, like `tokio::task::spawn_blocking()`.
     pub fn wait_for_change_blocking(&self) -> Option<IpChanges> {
