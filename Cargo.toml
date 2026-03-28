@@ -1,6 +1,6 @@
 [package]
 name = "iphost"
-version = "0.3.2"
+version = "0.3.3"
 edition = "2024"
 
 authors = ["Menhera.org Developers"]
@@ -20,5 +20,5 @@ broadcast = ["dep:tokio"]
 dropcatch = { version = "0.3" }
 tokio = { version = "1", default-features = false, features = ["sync"], optional = true }
 tracing = { version = "0.1", optional = true }
-fqdn = { version = "0.4.6", features = ["domain-label-length-limited-to-63", "domain-name-length-limited-to-255", "domain-name-without-special-chars", "domain-label-cannot-start-or-end-with-hyphen", "punycode"] }
+fqdn = { version = "0.5", features = ["domain-label-length-limited-to-63", "domain-name-length-limited-to-255", "domain-name-without-special-chars", "domain-label-cannot-start-or-end-with-hyphen", "punycode"] }
 serde = { version = "1", features = ["derive"], optional = true }
