@@ -1,6 +1,6 @@
 [package]
 name = "iphost"
-version = "0.3.3"
+version = "0.4.0"
 edition = "2024"
 
 authors = ["Menhera.org Developers"]
@@ -15,12 +15,19 @@ default = ["serde", "tracing", "broadcast"]
 serde = ["dep:serde"]
 tracing = ["dep:tracing"]
 broadcast = ["dep:tokio"]
+custom = ["dep:hickory-resolver", "dep:tokio", "tokio/net", "tokio/rt-multi-thread", "tokio/time", "dep:socket2", "dep:libc"]
 
 [dependencies]
 tokio = { version = "1", default-features = false, features = ["sync"], optional = true }
 tracing = { version = "0.1", optional = true }
 fqdn = { version = "0.5", features = ["domain-label-length-limited-to-63", "domain-name-length-limited-to-255", "domain-name-without-special-chars", "domain-label-cannot-start-or-end-with-hyphen", "punycode"] }
 serde = { version = "1", features = ["derive"], optional = true }
+hickory-resolver = { version = "0.26", default-features = false, features = ["tokio"], optional = true }
+socket2 = { version = "0.6", features = ["all"], optional = true }
+libc = { version = "0.2", optional = true }
 
 [dev-dependencies]
 tokio = { version = "1", default-features = false, features = ["rt-multi-thread"] }
+
+[package.metadata.docs.rs]
+all-features = true

@@ -15,6 +15,11 @@ pub enum Resolver {
     /// The operating system's resolver (`getaddrinfo(3)`).
     #[default]
     System,
+
+    /// Explicitly configured nameservers.
+    #[cfg(feature = "custom")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "custom")))]
+    Static(crate::StaticResolverConfig),
 }
 
 impl Resolver {
@@ -25,6 +30,8 @@ impl Resolver {
                 .to_socket_addrs()?
                 .map(|a| a.ip())
                 .collect()),
+            #[cfg(feature = "custom")]
+            Resolver::Static(config) => config.lookup(fqdn),
         }
     }
 }
