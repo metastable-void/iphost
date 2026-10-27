@@ -3,13 +3,13 @@
 #![cfg_attr(not(unix), allow(dead_code))]
 
 use std::io;
-use std::net::{IpAddr, Ipv6Addr, SocketAddr};
+use std::net::{IpAddr, Ipv6Addr};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
 use fqdn::FQDN;
 
-use crate::{BindDevice, StaticResolverConfig};
+use crate::custom::lookup_on_interface;
 
 /// How long a lookup waits for the first RA with DNS servers.
 const FIRST_RA_TIMEOUT: Duration = Duration::from_secs(3);
@@ -94,15 +94,7 @@ impl RaResolverConfig {
                 .unwrap_or_else(PoisonError::into_inner);
             state.current(Instant::now())
         };
-        if servers.is_empty() {
-            return Err(io::Error::new(
-                io::ErrorKind::NotFound,
-                "no DNS servers from router advertisements",
-            ));
-        }
-        StaticResolverConfig::new(servers.into_iter().map(|a| SocketAddr::new(a.into(), 53)))
-            .with_bind_device(BindDevice::Interface(self.interface.clone()))
-            .lookup(fqdn)
+        lookup_on_interface(servers, &self.interface, fqdn, "router advertisements")
     }
 }
 

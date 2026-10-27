@@ -30,6 +30,12 @@ pub enum Resolver {
     #[cfg(feature = "dhcpv6")]
     #[cfg_attr(docsrs, doc(cfg(feature = "dhcpv6")))]
     Dhcpv6(crate::Dhcpv6ResolverConfig),
+
+    /// DNS servers from DHCPv6 or Router Advertisements, whichever is available, preferring
+    /// DHCPv6. Uses only the sources whose features are enabled.
+    #[cfg(any(feature = "ra", feature = "dhcpv6"))]
+    #[cfg_attr(docsrs, doc(cfg(any(feature = "ra", feature = "dhcpv6"))))]
+    Ipv6(crate::Ipv6ResolverConfig),
 }
 
 impl Resolver {
@@ -46,6 +52,8 @@ impl Resolver {
             Resolver::Ra(config) => config.lookup(fqdn),
             #[cfg(feature = "dhcpv6")]
             Resolver::Dhcpv6(config) => config.lookup(fqdn),
+            #[cfg(any(feature = "ra", feature = "dhcpv6"))]
+            Resolver::Ipv6(config) => config.lookup(fqdn),
         }
     }
 }

@@ -139,8 +139,31 @@ fn runtime() -> io::Result<&'static tokio::runtime::Runtime> {
         .map_err(|e| io::Error::new(e.kind(), e.to_string()))
 }
 
+/// Looks up `fqdn` via discovered `servers` (port 53), bound to `interface`, which also scopes
+/// link-local servers. `source` names where the servers came from, for the error message.
+#[cfg(any(feature = "ra", feature = "dhcpv6"))]
+pub(crate) fn lookup_on_interface(
+    servers: Vec<std::net::Ipv6Addr>,
+    interface: &str,
+    fqdn: &FQDN,
+    source: &str,
+) -> io::Result<Vec<IpAddr>> {
+    if servers.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("no DNS servers from {source}"),
+        ));
+    }
+    StaticResolverConfig::new(servers.into_iter().map(|a| SocketAddr::new(a.into(), 53)))
+        .with_bind_device(BindDevice::Interface(interface.into()))
+        .lookup(fqdn)
+}
+
 /// `setsockopt(2)` with an `int` value, for options socket2 lacks.
-#[cfg(unix)]
+#[cfg(all(
+    unix,
+    any(feature = "ra", target_os = "openbsd", target_os = "freebsd")
+))]
 pub(crate) fn setsockopt_int(
     fd: std::os::fd::RawFd,
     level: libc::c_int,

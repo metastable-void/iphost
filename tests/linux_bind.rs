@@ -166,6 +166,53 @@ fn dhcpv6_random_duid_ll() {
     dhcpv6_resolver(iphost::ClientId::RandomDuidLl);
 }
 
+/// With both sources answering, DHCPv6 (fe80::2) takes precedence over RA (2001:db8:99::2).
+#[cfg(all(feature = "ra", feature = "dhcpv6"))]
+#[test]
+#[ignore = "needs tests/linux-bind.sh"]
+fn ipv6_prefers_dhcpv6() {
+    use std::time::{Duration, Instant};
+
+    let config = iphost::Ipv6ResolverConfig::new("ve0", iphost::ClientId::None).unwrap();
+    let resolver = IpHostResolver::new_with_config("example.test".parse().unwrap(), false, false)
+        .with_resolver(Resolver::Ipv6(config.clone()));
+    assert_eq!(resolver.resolve(), vec![VIA_INTERFACE]);
+    // RA may answer first; DHCPv6 wins as soon as both have.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while config.ra().unwrap().nameservers().is_empty() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert!(!config.ra().unwrap().nameservers().is_empty());
+    assert_eq!(
+        config.nameservers(),
+        vec!["fe80::2".parse::<std::net::Ipv6Addr>().unwrap()]
+    );
+}
+
+/// Run by the script as nobody with no DHCPv6 server: RA alone suffices.
+#[cfg(all(feature = "ra", feature = "dhcpv6"))]
+#[test]
+#[ignore = "needs tests/linux-bind.sh"]
+fn ipv6_ra_fallback() {
+    use std::time::{Duration, Instant};
+
+    let config = iphost::Ipv6ResolverConfig::new("ve0", iphost::ClientId::None).unwrap();
+    let resolver = IpHostResolver::new_with_config("example.test".parse().unwrap(), false, false)
+        .with_resolver(Resolver::Ipv6(config.clone()));
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let addrs = loop {
+        let addrs = resolver.resolve();
+        if !addrs.is_empty() || Instant::now() > deadline {
+            break addrs;
+        }
+    };
+    assert_eq!(addrs, vec![VIA_INTERFACE]);
+    assert_eq!(
+        config.nameservers(),
+        vec!["2001:db8:99::2".parse::<std::net::Ipv6Addr>().unwrap()]
+    );
+}
+
 /// The resolver can be swapped at runtime.
 #[test]
 #[ignore = "needs tests/linux-bind.sh"]

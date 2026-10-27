@@ -16,6 +16,7 @@ FQDNs are resolved with the system resolver by default. The DNS resolver can be 
 - `custom`: `Resolver::Static` to query explicitly configured nameservers (via hickory-resolver), optionally bound to an interface or a VRF (Linux VRF, OpenBSD rdomain, FreeBSD FIB).
 - `ra` (implies `custom`): `Resolver::Ra` to use the DNS servers advertised by IPv6 routers (RDNSS) on an interface. Reads RAs on a raw ICMPv6 socket and sends Router Solicitations when privileged; falls back to the kernel's RA options via netlink when unprivileged on Linux.
 - `dhcpv6` (implies `custom`): `Resolver::Dhcpv6` to use the DNS servers from stateless DHCPv6 (Information-Request) on an interface. Needs to bind UDP port 546. The Client Identifier must be chosen explicitly, since some networks require a particular one.
+- With `ra` and/or `dhcpv6`: `Resolver::Ipv6` uses DHCPv6 or Router Advertisements on an interface, whichever is available, preferring DHCPv6. Only the enabled sources are used: with just `ra` it behaves like `Resolver::Ra` (and ignores the Client Identifier), with just `dhcpv6` like `Resolver::Dhcpv6`.
 
 ## Network-specific notes
 

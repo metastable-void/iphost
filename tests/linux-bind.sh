@@ -80,14 +80,16 @@ EOF
     sysctl -qw net.ipv6.conf.ve0.accept_ra=0
     radvd_start on
     sleep 1
-    /test/linux_bind --ignored --test-threads=1
+    /test/linux_bind --ignored --test-threads=1 --skip ipv6_ra_fallback
 
-    # Netlink path: unprivileged, the kernel processes periodic RAs.
-    kill "$(cat /run/radvd.pid)"
+    # Netlink path: unprivileged, the kernel processes periodic RAs. No DHCPv6 server, so
+    # Ipv6ResolverConfig falls back to RA.
+    kill "$(cat /run/radvd.pid)" "$(cat /run/dnsmasq-dhcpv6.pid)"
     sleep 1
     sysctl -qw net.ipv6.conf.ve0.accept_ra=2
     radvd_start off
-    exec su -s /bin/sh nobody -c '/test/linux_bind --ignored --exact ra_resolver'
+    exec su -s /bin/sh nobody -c \
+        '/test/linux_bind --ignored --test-threads=1 --exact ra_resolver ipv6_ra_fallback'
 fi
 
 cd "$(dirname "$0")/.."
