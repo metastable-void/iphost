@@ -26,5 +26,5 @@ pub use host::IpHost;
 #[cfg(any(feature = "ra", feature = "dhcpv6"))]
 pub use ipv6::Ipv6ResolverConfig;
 #[cfg(feature = "ra")]
-pub use ra::RaResolverConfig;
+pub use ra::{RaResolverConfig, RaSource};
 pub use resolver::{IpHostResolver, Resolver};

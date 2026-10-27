@@ -15,7 +15,7 @@ default = ["serde", "tracing", "broadcast"]
 serde = ["dep:serde"]
 tracing = ["dep:tracing"]
 broadcast = ["dep:tokio"]
-custom = ["dep:hickory-resolver", "dep:tokio", "tokio/net", "tokio/rt-multi-thread", "tokio/time", "dep:socket2", "dep:libc", "dep:windows-sys"]
+custom = ["dep:socket2", "dep:libc", "dep:windows-sys"]
 ra = ["custom"]
 dhcpv6 = ["custom"]
 
@@ -24,7 +24,6 @@ tokio = { version = "1", default-features = false, features = ["sync"], optional
 tracing = { version = "0.1", optional = true }
 fqdn = { version = "0.5", features = ["domain-label-length-limited-to-63", "domain-name-length-limited-to-255", "domain-name-without-special-chars", "domain-label-cannot-start-or-end-with-hyphen", "punycode"] }
 serde = { version = "1", features = ["derive"], optional = true }
-hickory-resolver = { version = "0.26", default-features = false, features = ["tokio"], optional = true }
 socket2 = { version = "0.6", features = ["all"], optional = true }
 libc = { version = "0.2", optional = true }
 

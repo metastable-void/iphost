@@ -9,11 +9,10 @@ use fqdn::FQDN;
 use socket2::{Domain, Protocol, SockRef, Socket, Type};
 
 use crate::ClientId;
-use crate::custom::{bind_to_interface, if_index, lookup_on_interface};
-use crate::duid::random_u32;
+use crate::custom::{
+    DISCOVERY_TIMEOUT, bind_to_interface, if_index, lookup_on_interface, random_u32,
+};
 
-/// How long a lookup waits for the first Reply.
-const FIRST_REPLY_TIMEOUT: Duration = Duration::from_secs(3);
 /// Also how often the thread notices that every config was dropped.
 const RECV_TIMEOUT: Duration = Duration::from_secs(1);
 
@@ -144,7 +143,7 @@ impl Dhcpv6ResolverConfig {
             let (servers, _) = self
                 .shared
                 .cond
-                .wait_timeout_while(servers, FIRST_REPLY_TIMEOUT, |s| s.is_none())
+                .wait_timeout_while(servers, DISCOVERY_TIMEOUT, |s| s.is_none())
                 .unwrap_or_else(PoisonError::into_inner);
             servers.clone().unwrap_or_default()
         };

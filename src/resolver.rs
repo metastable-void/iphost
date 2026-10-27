@@ -1,10 +1,13 @@
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, ToSocketAddrs};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::time::Duration;
 
 use fqdn::FQDN;
 
 use crate::IpHost;
+#[cfg(feature = "custom")]
+use crate::custom;
 
 /// DNS resolver used to resolve FQDNs.
 ///
@@ -16,8 +19,8 @@ pub enum Resolver {
     #[default]
     System,
 
-    /// Explicitly configured nameservers. The system hosts file is not consulted; `localhost`
-    /// is still answered locally (RFC 6761).
+    /// Explicitly configured nameservers, asked directly by a built-in stub client: neither
+    /// the system hosts file nor the `localhost` special case applies.
     #[cfg(feature = "custom")]
     #[cfg_attr(docsrs, doc(cfg(feature = "custom")))]
     Static(crate::StaticResolverConfig),
@@ -40,6 +43,23 @@ pub enum Resolver {
 }
 
 impl Resolver {
+    /// Upper bound on how long a lookup with this resolver blocks, when this crate controls it.
+    ///
+    /// The built-in client asks each nameserver in turn, twice, with a fixed timeout per query,
+    /// and queries both address families in parallel. The discovering resolvers (`Ra`,
+    /// `Dhcpv6`, `Ipv6`) first wait a bounded time for their nameservers, of which at most
+    /// three are used. `None` for [`Resolver::System`], whose timeouts are the operating
+    /// system's.
+    pub fn max_lookup_time(&self) -> Option<Duration> {
+        match self {
+            Resolver::System => None,
+            #[cfg(feature = "custom")]
+            Resolver::Static(config) => Some(custom::query_time_bound(config.nameservers().len())),
+            #[cfg(any(feature = "ra", feature = "dhcpv6"))]
+            _ => Some(custom::DISCOVERY_TIMEOUT + custom::query_time_bound(custom::MAX_SERVERS)),
+        }
+    }
+
     /// Blocking lookup. MUST NOT require the caller to be outside of (or inside) a tokio runtime.
     fn lookup(&self, fqdn: &FQDN) -> io::Result<Vec<IpAddr>> {
         match self {
@@ -207,7 +227,8 @@ impl IpHostResolver {
 
     /// Resolves the hostname, refreshes the stored values, and returns all resolved IP addresses.
     ///
-    /// This WILL block the calling thread. It is safe to call from `tokio::task::spawn_blocking()`.
+    /// This WILL block the calling thread, for at most [`Resolver::max_lookup_time`] when that
+    /// is `Some`. It is safe to call from `tokio::task::spawn_blocking()`.
     pub fn resolve(&self) -> Vec<IpAddr> {
         let (fqdn, resolver, generation) = {
             let state = self.state();
@@ -353,6 +374,18 @@ mod tests {
         assert_eq!(old, IpHost::V4Addr(Ipv4Addr::LOCALHOST));
         assert_eq!(resolver.ipv4_addr(), None);
         assert_eq!(resolver.ipv6_addr(), Some(Ipv6Addr::LOCALHOST));
+    }
+
+    #[cfg(feature = "custom")]
+    #[test]
+    fn lookup_time_bound() {
+        assert_eq!(Resolver::System.max_lookup_time(), None);
+        let servers = [
+            "192.0.2.1:53".parse().unwrap(),
+            "192.0.2.2:53".parse().unwrap(),
+        ];
+        let bound = Resolver::Static(crate::StaticResolverConfig::new(servers)).max_lookup_time();
+        assert_eq!(bound, Some(Duration::from_secs(20)));
     }
 
     #[test]

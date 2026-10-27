@@ -2,9 +2,9 @@
 // Only `dhcpv6` sends them; with `ra` alone, `Ipv6ResolverConfig` accepts and ignores them.
 #![cfg_attr(not(feature = "dhcpv6"), allow(dead_code))]
 
-use std::hash::{BuildHasher, RandomState};
 use std::io;
-use std::time::Instant;
+
+use crate::custom::random_u32;
 
 /// DHCPv6 Client Identifier sent in Information-Requests.
 ///
@@ -96,10 +96,6 @@ impl ClientId {
             _ => None,
         }
     }
-}
-
-pub(crate) fn random_u32() -> u32 {
-    RandomState::new().hash_one(Instant::now()) as u32
 }
 
 #[cfg(test)]

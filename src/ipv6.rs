@@ -7,10 +7,8 @@ use std::time::{Duration, Instant};
 use fqdn::FQDN;
 
 use crate::ClientId;
-use crate::custom::lookup_on_interface;
+use crate::custom::{DISCOVERY_TIMEOUT, lookup_on_interface};
 
-/// How long a lookup waits for the first DNS servers from any source.
-const FIRST_SERVERS_TIMEOUT: Duration = Duration::from_secs(3);
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 /// Configuration for [`Resolver::Ipv6`](crate::Resolver::Ipv6): DNS servers from DHCPv6 or Router
@@ -121,7 +119,7 @@ impl Ipv6ResolverConfig {
 
     pub(crate) fn lookup(&self, fqdn: &FQDN) -> io::Result<Vec<IpAddr>> {
         // shortcut: polls instead of waiting on the sources' condvars; fine for a short startup wait.
-        let deadline = Instant::now() + FIRST_SERVERS_TIMEOUT;
+        let deadline = Instant::now() + DISCOVERY_TIMEOUT;
         loop {
             let servers = self.nameservers();
             if !servers.is_empty() || Instant::now() >= deadline {
@@ -132,7 +130,9 @@ impl Ipv6ResolverConfig {
                 };
                 return lookup_on_interface(servers, &self.interface, fqdn, source);
             }
-            std::thread::sleep(POLL_INTERVAL);
+            std::thread::sleep(
+                POLL_INTERVAL.min(deadline.saturating_duration_since(Instant::now())),
+            );
         }
     }
 }

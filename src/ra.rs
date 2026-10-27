@@ -9,10 +9,7 @@ use std::time::{Duration, Instant};
 
 use fqdn::FQDN;
 
-use crate::custom::lookup_on_interface;
-
-/// How long a lookup waits for the first RA with DNS servers.
-const FIRST_RA_TIMEOUT: Duration = Duration::from_secs(3);
+use crate::custom::{DISCOVERY_TIMEOUT, lookup_on_interface};
 
 /// Netlink delivers one message per RDNSS option; messages from the same router this close
 /// together are treated as one RA.
@@ -22,6 +19,18 @@ const ND_ROUTER_SOLICIT: u8 = 133;
 const ND_ROUTER_ADVERT: u8 = 134;
 const ND_OPT_RDNSS: u8 = 25;
 
+/// Where an [`RaResolverConfig`] gets Router Advertisements from.
+#[cfg_attr(docsrs, doc(cfg(feature = "ra")))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum RaSource {
+    /// A raw ICMPv6 socket: RAs are read and validated here, and solicited.
+    RawSocket,
+    /// The kernel's RA options over netlink (Linux, unprivileged): only RAs the kernel
+    /// processes, and only unsolicited ones.
+    Netlink,
+}
+
 /// Configuration for [`Resolver::Ra`](crate::Resolver::Ra): DNS servers advertised by routers on an interface.
 ///
 /// Clones share one listener, which stops when the last clone is dropped.
@@ -29,6 +38,7 @@ const ND_OPT_RDNSS: u8 = 25;
 #[derive(Clone)]
 pub struct RaResolverConfig {
     interface: String,
+    source: RaSource,
     shared: Arc<Shared>,
 }
 
@@ -36,6 +46,7 @@ impl std::fmt::Debug for RaResolverConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("RaResolverConfig")
             .field("interface", &self.interface)
+            .field("source", &self.source)
             .field("nameservers", &self.nameservers())
             .finish()
     }
@@ -71,12 +82,21 @@ impl RaResolverConfig {
     pub fn new(interface: impl Into<String>) -> io::Result<Self> {
         let interface = interface.into();
         let shared = Arc::new(Shared::default());
-        sys::spawn(interface.clone(), Arc::downgrade(&shared))?;
-        Ok(Self { interface, shared })
+        let source = sys::spawn(interface.clone(), Arc::downgrade(&shared))?;
+        Ok(Self {
+            interface,
+            source,
+            shared,
+        })
     }
 
     pub fn interface(&self) -> &str {
         &self.interface
+    }
+
+    /// Whether RAs come from a raw socket or the netlink fallback.
+    pub fn source(&self) -> RaSource {
+        self.source
     }
 
     /// Current DNS servers: the unexpired ones, or the expired ones if none are left.
@@ -90,7 +110,7 @@ impl RaResolverConfig {
             let (state, _) = self
                 .shared
                 .cond
-                .wait_timeout_while(state, FIRST_RA_TIMEOUT, |s| s.servers.is_empty())
+                .wait_timeout_while(state, DISCOVERY_TIMEOUT, |s| s.servers.is_empty())
                 .unwrap_or_else(PoisonError::into_inner);
             state.current(Instant::now())
         };
@@ -228,7 +248,7 @@ mod sys {
 
     use socket2::{Domain, Protocol, SockAddr, SockRef, Socket, Type};
 
-    use super::{ND_ROUTER_ADVERT, ND_ROUTER_SOLICIT, Shared, Update, parse_ra};
+    use super::{ND_ROUTER_ADVERT, ND_ROUTER_SOLICIT, RaSource, Shared, Update, parse_ra};
     use crate::custom::{bind_to_interface, if_index, setsockopt};
 
     /// Also how often the thread notices that every config was dropped.
@@ -266,7 +286,7 @@ mod sys {
         Netlink(Socket),
     }
 
-    pub(super) fn spawn(interface: String, shared: Weak<Shared>) -> io::Result<()> {
+    pub(super) fn spawn(interface: String, shared: Weak<Shared>) -> io::Result<RaSource> {
         let source = match open_raw() {
             Ok(socket) => Source::Raw(socket),
             #[cfg(target_os = "linux")]
@@ -275,10 +295,15 @@ mod sys {
             }
             Err(e) => return Err(e),
         };
+        let kind = match source {
+            Source::Raw(_) => RaSource::RawSocket,
+            #[cfg(target_os = "linux")]
+            Source::Netlink(_) => RaSource::Netlink,
+        };
         std::thread::Builder::new()
             .name("iphost-ra".into())
             .spawn(move || run(source, &interface, &shared))?;
-        Ok(())
+        Ok(kind)
     }
 
     /// RFC 3542 `ICMP6_FILTER` that passes only Router Advertisements. A set bit blocks a type,
@@ -559,7 +584,10 @@ mod sys {
     use std::io;
     use std::sync::Weak;
 
-    pub(super) fn spawn(_interface: String, _shared: Weak<super::Shared>) -> io::Result<()> {
+    pub(super) fn spawn(
+        _interface: String,
+        _shared: Weak<super::Shared>,
+    ) -> io::Result<super::RaSource> {
         Err(io::Error::new(
             io::ErrorKind::Unsupported,
             "router advertisements are not supported on this platform",
