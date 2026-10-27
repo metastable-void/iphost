@@ -79,19 +79,20 @@ struct State {
     resolver: Resolver,
     v4_addr: Option<Ipv4Addr>,
     v6_addr: Option<Ipv6Addr>,
-    /// Bumped on every hostname change, so that in-flight lookups for an old hostname are discarded.
+    /// Bumped on every hostname or resolver change, so that in-flight lookups for the old
+    /// configuration are discarded.
     generation: u64,
 }
 
 impl State {
-    fn set_ip_host(&mut self, ip_host: IpHost) -> IpHost {
-        (self.v4_addr, self.v6_addr) = match &ip_host {
+    /// Forgets results from the previous configuration.
+    fn reset(&mut self) {
+        (self.v4_addr, self.v6_addr) = match &self.ip_host {
             IpHost::V4Addr(addr) => (Some(*addr), None),
             IpHost::V6Addr(addr) => (None, Some(*addr)),
             IpHost::Fqdn(_) => (None, None),
         };
         self.generation += 1;
-        std::mem::replace(&mut self.ip_host, ip_host)
     }
 }
 
@@ -108,13 +109,13 @@ impl IpHostResolver {
         retain_stale_values: bool,
     ) -> Self {
         let mut state = State {
-            ip_host: ip_host.clone(),
+            ip_host,
             resolver: Resolver::default(),
             v4_addr: None,
             v6_addr: None,
             generation: 0,
         };
-        state.set_ip_host(ip_host);
+        state.reset();
 
         Self {
             inner: Arc::new(Inner {
@@ -178,12 +179,20 @@ impl IpHostResolver {
         if state.ip_host == new {
             return new;
         }
-        state.set_ip_host(new)
+        let old = std::mem::replace(&mut state.ip_host, new);
+        state.reset();
+        old
     }
 
-    /// Replaces the DNS resolver, returning the old one. Takes effect from the next resolution.
+    /// Replaces the DNS resolver, returning the old one.
+    ///
+    /// Cached addresses are reset, and any in-flight resolution with the old resolver is
+    /// discarded, so nothing from the old resolver is used afterwards.
     pub fn set_resolver(&self, resolver: Resolver) -> Resolver {
-        std::mem::replace(&mut self.state().resolver, resolver)
+        let mut state = self.state();
+        let old = std::mem::replace(&mut state.resolver, resolver);
+        state.reset();
+        old
     }
 
     fn cached(state: &State) -> Vec<IpAddr> {
@@ -213,7 +222,7 @@ impl IpHostResolver {
 
         let mut state = self.state();
         if state.generation != generation {
-            // The hostname changed while resolving.
+            // The hostname or resolver changed while resolving.
             return Self::cached(&state);
         }
 
@@ -343,5 +352,18 @@ mod tests {
         assert_eq!(old, IpHost::V4Addr(Ipv4Addr::LOCALHOST));
         assert_eq!(resolver.ipv4_addr(), None);
         assert_eq!(resolver.ipv6_addr(), Some(Ipv6Addr::LOCALHOST));
+    }
+
+    #[test]
+    fn set_resolver_resets_cache() {
+        let resolver = IpHostResolver::new("localhost".parse().unwrap());
+        resolver.resolve();
+        assert!(resolver.ipv4_addr().is_some());
+        resolver.set_resolver(Resolver::System);
+        assert_eq!(resolver.ipv4_addr(), None);
+        // Literal addresses stay, as they need no resolver.
+        let literal = IpHostResolver::new(IpHost::V4Addr(Ipv4Addr::LOCALHOST));
+        literal.set_resolver(Resolver::System);
+        assert_eq!(literal.ipv4_addr(), Some(Ipv4Addr::LOCALHOST));
     }
 }

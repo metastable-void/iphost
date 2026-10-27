@@ -41,10 +41,10 @@ impl std::fmt::Debug for RaResolverConfig {
     }
 }
 
-/// Equal when listening on the same interface.
+/// Equal only for clones of the same config, which share one listener.
 impl PartialEq for RaResolverConfig {
     fn eq(&self, other: &Self) -> bool {
-        self.interface == other.interface
+        Arc::ptr_eq(&self.shared, &other.shared)
     }
 }
 
@@ -52,7 +52,7 @@ impl Eq for RaResolverConfig {}
 
 impl std::hash::Hash for RaResolverConfig {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        self.interface.hash(state);
+        Arc::as_ptr(&self.shared).hash(state);
     }
 }
 
@@ -226,10 +226,10 @@ mod sys {
     use std::sync::Weak;
     use std::time::{Duration, Instant};
 
-    use socket2::{Domain, Protocol, SockAddr, Socket, Type};
+    use socket2::{Domain, Protocol, SockAddr, SockRef, Socket, Type};
 
     use super::{ND_ROUTER_ADVERT, ND_ROUTER_SOLICIT, Shared, Update, parse_ra};
-    use crate::custom::{if_index, setsockopt_int};
+    use crate::custom::{bind_to_interface, if_index, setsockopt_int};
 
     /// Also how often the thread notices that every config was dropped.
     const RECV_TIMEOUT: Duration = Duration::from_secs(1);
@@ -287,10 +287,23 @@ mod sys {
         let mut buf = vec![0u8; 65536];
         let mut solicitations = 0;
         let mut next_solicitation = Instant::now();
+        let mut bound_index = None;
 
         while let Some(shared) = shared.upgrade() {
             let updates = match &source {
                 Source::Raw(socket) => {
+                    // Tied to the interface, so RAs arrive even when it is enslaved to a Linux
+                    // VRF (no reliance on `raw_l3mdev_accept`). Re-tied when it is re-created.
+                    let index = if_index(interface).ok();
+                    if index.is_some() && index != bound_index {
+                        match bind_to_interface(&SockRef::from(socket), interface, true) {
+                            Ok(()) => bound_index = index,
+                            Err(_e) => {
+                                #[cfg(feature = "tracing")]
+                                tracing::warn!(error = %_e, interface, "RA socket binding failed");
+                            }
+                        }
+                    }
                     if solicitations < MAX_RTR_SOLICITATIONS
                         && shared.state().last.is_none()
                         && Instant::now() >= next_solicitation

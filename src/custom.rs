@@ -262,26 +262,11 @@ impl Provider {
     }
 
     fn bind_device(&self, socket: SockRef<'_>, ipv6: bool) -> io::Result<()> {
-        let _ = (&socket, ipv6);
         match &self.config.bind_device {
             None => Ok(()),
+            Some(BindDevice::Interface(name)) => bind_to_interface(&socket, name, ipv6),
             #[cfg(target_os = "linux")]
-            Some(BindDevice::Interface(name) | BindDevice::Vrf(name)) => {
-                socket.bind_device(Some(name.as_bytes()))
-            }
-            #[cfg(any(target_vendor = "apple", target_os = "illumos", target_os = "solaris"))]
-            Some(BindDevice::Interface(name)) => {
-                let index = std::num::NonZeroU32::new(if_index(name)?);
-                if ipv6 {
-                    socket.bind_device_by_index_v6(index)
-                } else {
-                    socket.bind_device_by_index_v4(index)
-                }
-            }
-            #[cfg(any(target_os = "openbsd", target_os = "freebsd"))]
-            Some(BindDevice::Interface(name)) => {
-                rtable::set(&socket, rtable::of_interface(&socket, name)?)
-            }
+            Some(BindDevice::Vrf(name)) => socket.bind_device(Some(name.as_bytes())),
             #[cfg(any(target_os = "openbsd", target_os = "freebsd"))]
             Some(BindDevice::Vrf(table)) => rtable::set(
                 &socket,
@@ -292,16 +277,48 @@ impl Provider {
                     )
                 })?,
             ),
-            #[cfg(not(any(
-                target_os = "linux",
-                target_vendor = "apple",
-                target_os = "illumos",
-                target_os = "solaris",
-                target_os = "openbsd",
-                target_os = "freebsd"
-            )))]
-            Some(BindDevice::Interface(_)) => Ok(()),
         }
+    }
+}
+
+/// Ties `socket` to `interface` for sending and receiving, as [`BindDevice::Interface`] documents.
+///
+/// On Linux, sockets not bound to a device do not receive packets from interfaces enslaved to
+/// a VRF unless the `udp_l3mdev_accept` / `raw_l3mdev_accept` sysctls say so; this does not
+/// depend on them.
+pub(crate) fn bind_to_interface(
+    socket: &SockRef<'_>,
+    interface: &str,
+    ipv6: bool,
+) -> io::Result<()> {
+    let _ = (socket, interface, ipv6);
+    #[cfg(target_os = "linux")]
+    {
+        socket.bind_device(Some(interface.as_bytes()))
+    }
+    #[cfg(any(target_vendor = "apple", target_os = "illumos", target_os = "solaris"))]
+    {
+        let index = std::num::NonZeroU32::new(if_index(interface)?);
+        if ipv6 {
+            socket.bind_device_by_index_v6(index)
+        } else {
+            socket.bind_device_by_index_v4(index)
+        }
+    }
+    #[cfg(any(target_os = "openbsd", target_os = "freebsd"))]
+    {
+        rtable::set(socket, rtable::of_interface(socket, interface)?)
+    }
+    #[cfg(not(any(
+        target_os = "linux",
+        target_vendor = "apple",
+        target_os = "illumos",
+        target_os = "solaris",
+        target_os = "openbsd",
+        target_os = "freebsd"
+    )))]
+    {
+        Ok(())
     }
 }
 

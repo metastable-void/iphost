@@ -166,6 +166,61 @@ fn dhcpv6_random_duid_ll() {
     dhcpv6_resolver(iphost::ClientId::RandomDuidLl);
 }
 
+/// Waits until every config has DNS servers, returning them.
+#[cfg(feature = "dhcpv6")]
+fn wait_dhcpv6(configs: &[&iphost::Dhcpv6ResolverConfig]) -> Vec<Vec<std::net::Ipv6Addr>> {
+    use std::time::{Duration, Instant};
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while configs.iter().any(|c| c.nameservers().is_empty()) && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    configs.iter().map(|c| c.nameservers()).collect()
+}
+
+/// Many DHCPv6 clients at once, on the same interface and on another one (in a VRF), must not
+/// take each other's Replies.
+#[cfg(feature = "dhcpv6")]
+#[test]
+#[ignore = "needs tests/linux-bind.sh"]
+fn dhcpv6_many_instances() {
+    use iphost::{ClientId, Dhcpv6ResolverConfig};
+
+    let a = Dhcpv6ResolverConfig::new("ve0", ClientId::None).unwrap();
+    let b = Dhcpv6ResolverConfig::new("ve0", ClientId::RandomDuidLl).unwrap();
+    let c = Dhcpv6ResolverConfig::new("ve0", ClientId::None).unwrap();
+    let d = Dhcpv6ResolverConfig::new("ve2", ClientId::None).unwrap();
+    let e = Dhcpv6ResolverConfig::new("ve2", ClientId::RandomDuidLl).unwrap();
+    let ve0: Vec<std::net::Ipv6Addr> = vec!["fe80::2".parse().unwrap()];
+    let ve2: Vec<std::net::Ipv6Addr> = vec!["2001:db8:98::2".parse().unwrap()];
+    assert_eq!(
+        wait_dhcpv6(&[&a, &b, &c, &d, &e]),
+        [ve0.clone(), ve0.clone(), ve0, ve2.clone(), ve2]
+    );
+}
+
+/// DHCPv6 on an interface enslaved to a VRF, with `udp_l3mdev_accept=0`.
+#[cfg(feature = "dhcpv6")]
+#[test]
+#[ignore = "needs tests/linux-bind.sh"]
+fn dhcpv6_vrf() {
+    let config = iphost::Dhcpv6ResolverConfig::new("ve2", iphost::ClientId::None).unwrap();
+    let resolver = IpHostResolver::new_with_config("example.test".parse().unwrap(), false, false)
+        .with_resolver(Resolver::Dhcpv6(config));
+    assert_eq!(resolver.resolve(), vec![VIA_VRF]);
+}
+
+/// RA on an interface enslaved to a VRF, with `raw_l3mdev_accept=0`.
+#[cfg(feature = "ra")]
+#[test]
+#[ignore = "needs tests/linux-bind.sh"]
+fn ra_vrf() {
+    let config = iphost::RaResolverConfig::new("ve2").unwrap();
+    let resolver = IpHostResolver::new_with_config("example.test".parse().unwrap(), false, false)
+        .with_resolver(Resolver::Ra(config));
+    assert_eq!(resolver.resolve(), vec![VIA_VRF]);
+}
+
 /// With both sources answering, DHCPv6 (fe80::2) takes precedence over RA (2001:db8:99::2).
 #[cfg(all(feature = "ra", feature = "dhcpv6"))]
 #[test]

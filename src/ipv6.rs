@@ -22,30 +22,16 @@ const POLL_INTERVAL: Duration = Duration::from_millis(50);
 ///
 /// **Some networks require a particular DHCPv6 Client Identifier; see [`ClientId`].**
 ///
-/// Clones share the same sources, which stop when the last clone is dropped.
+/// Clones share the same sources, which stop when the last clone is dropped. Only clones of
+/// the same config compare equal.
 #[cfg_attr(docsrs, doc(cfg(any(feature = "ra", feature = "dhcpv6"))))]
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Ipv6ResolverConfig {
     interface: String,
     #[cfg(feature = "dhcpv6")]
     dhcpv6: Option<crate::Dhcpv6ResolverConfig>,
     #[cfg(feature = "ra")]
     ra: Option<crate::RaResolverConfig>,
-}
-
-/// Equal when using the same interface.
-impl PartialEq for Ipv6ResolverConfig {
-    fn eq(&self, other: &Self) -> bool {
-        self.interface == other.interface
-    }
-}
-
-impl Eq for Ipv6ResolverConfig {}
-
-impl std::hash::Hash for Ipv6ResolverConfig {
-    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        self.interface.hash(state);
-    }
 }
 
 impl Ipv6ResolverConfig {
