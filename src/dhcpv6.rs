@@ -260,10 +260,6 @@ impl Listener {
             .clone()
     }
 
-    fn socket(&self) -> Arc<UdpSocket> {
-        self.current().0
-    }
-
     /// Re-creates the socket when the interface appears, disappears, or is re-created.
     /// (Changing an existing device binding would need more privileges on Linux.)
     fn follow_interface(&self) {
@@ -339,8 +335,16 @@ fn run(
 ) {
     let mut exchange: Option<Exchange> = None;
     let mut next_send = Instant::now();
+    let mut bound_index = None;
 
     while let Some(shared) = shared.upgrade() {
+        let (socket, index) = listener.current();
+        if index != bound_index {
+            // The interface appeared, vanished or was re-created: ask again right away.
+            bound_index = index;
+            exchange = None;
+            next_send = Instant::now();
+        }
         let now = Instant::now();
         if now >= next_send {
             let ex = exchange.get_or_insert_with(|| Exchange {
@@ -348,7 +352,7 @@ fn run(
                 started: now,
                 rt: jitter(INF_TIMEOUT),
             });
-            if let Err(_e) = send(&listener.socket(), interface, duid, ex, now) {
+            if let Err(_e) = send(&socket, interface, duid, ex, now) {
                 #[cfg(feature = "tracing")]
                 tracing::debug!(error = %_e, interface, "DHCPv6 Information-Request failed");
             }

@@ -16,7 +16,8 @@ pub enum Resolver {
     #[default]
     System,
 
-    /// Explicitly configured nameservers.
+    /// Explicitly configured nameservers. The system hosts file is not consulted; `localhost`
+    /// is still answered locally (RFC 6761).
     #[cfg(feature = "custom")]
     #[cfg_attr(docsrs, doc(cfg(feature = "custom")))]
     Static(crate::StaticResolverConfig),
@@ -102,7 +103,7 @@ impl IpHostResolver {
     /// This method accepts options about what to do on error conditions.
     ///
     /// - `use_cached_on_error`: whether to use cached results when a resolution error occurs.
-    /// - `retain_stale_values`: whether to keep cached results when the resolution results in an empty address set.
+    /// - `retain_stale_values`: whether to keep the cached IPv4 / IPv6 address when a resolution returns no address of that family.
     pub fn new_with_config(
         ip_host: IpHost,
         use_cached_on_error: bool,

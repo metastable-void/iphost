@@ -229,7 +229,7 @@ mod sys {
     use socket2::{Domain, Protocol, SockAddr, SockRef, Socket, Type};
 
     use super::{ND_ROUTER_ADVERT, ND_ROUTER_SOLICIT, Shared, Update, parse_ra};
-    use crate::custom::{bind_to_interface, if_index, setsockopt_int};
+    use crate::custom::{bind_to_interface, if_index, setsockopt};
 
     /// Also how often the thread notices that every config was dropped.
     const RECV_TIMEOUT: Duration = Duration::from_secs(1);
@@ -254,6 +254,12 @@ mod sys {
     #[cfg(not(any(target_os = "openbsd", target_os = "netbsd")))]
     const IPV6_HOPLIMIT: libc::c_int = libc::IPV6_HOPLIMIT;
 
+    // Missing from libc everywhere.
+    #[cfg(any(target_os = "linux", target_os = "illumos", target_os = "solaris"))]
+    const ICMP6_FILTER: libc::c_int = 1;
+    #[cfg(not(any(target_os = "linux", target_os = "illumos", target_os = "solaris")))]
+    const ICMP6_FILTER: libc::c_int = 18; // KAME: the BSDs and macOS.
+
     enum Source {
         Raw(Socket),
         #[cfg(target_os = "linux")]
@@ -275,9 +281,18 @@ mod sys {
         Ok(())
     }
 
+    /// RFC 3542 `ICMP6_FILTER` that passes only Router Advertisements (a set bit blocks a type).
+    pub(super) fn ra_only_filter() -> [u32; 8] {
+        let mut filter = [u32::MAX; 8];
+        filter[usize::from(ND_ROUTER_ADVERT / 32)] &= !(1 << (ND_ROUTER_ADVERT % 32));
+        filter
+    }
+
     fn open_raw() -> io::Result<Socket> {
         let socket = Socket::new(Domain::IPV6, Type::RAW, Some(Protocol::ICMPV6))?;
-        setsockopt_int(socket.as_raw_fd(), libc::IPPROTO_IPV6, IPV6_RECVHOPLIMIT, 1)?;
+        let fd = socket.as_raw_fd();
+        setsockopt(fd, libc::IPPROTO_ICMPV6, ICMP6_FILTER, &ra_only_filter())?;
+        setsockopt(fd, libc::IPPROTO_IPV6, IPV6_RECVHOPLIMIT, &1)?;
         socket.set_multicast_hops_v6(255)?;
         socket.set_read_timeout(Some(RECV_TIMEOUT))?;
         Ok(socket)
@@ -288,6 +303,8 @@ mod sys {
         let mut solicitations = 0;
         let mut next_solicitation = Instant::now();
         let mut bound_index = None;
+        // Solicitations stop at the first RA and start over whenever the socket is (re)tied.
+        let mut answered = false;
 
         while let Some(shared) = shared.upgrade() {
             let updates = match &source {
@@ -297,15 +314,20 @@ mod sys {
                     let index = if_index(interface).ok();
                     if index.is_some() && index != bound_index {
                         match bind_to_interface(&SockRef::from(socket), interface, true) {
-                            Ok(()) => bound_index = index,
+                            Ok(()) => {
+                                bound_index = index;
+                                solicitations = 0;
+                                next_solicitation = Instant::now();
+                                answered = false;
+                            }
                             Err(_e) => {
                                 #[cfg(feature = "tracing")]
                                 tracing::warn!(error = %_e, interface, "RA socket binding failed");
                             }
                         }
                     }
-                    if solicitations < MAX_RTR_SOLICITATIONS
-                        && shared.state().last.is_none()
+                    if !answered
+                        && solicitations < MAX_RTR_SOLICITATIONS
                         && Instant::now() >= next_solicitation
                     {
                         solicitations += 1;
@@ -315,7 +337,7 @@ mod sys {
                             tracing::debug!(error = %_e, interface, "Router Solicitation failed");
                         }
                     }
-                    recv_ra(socket.as_raw_fd(), &mut buf, interface).map(Vec::from_iter)
+                    recv_ra(socket.as_raw_fd(), &mut buf, index).map(Vec::from_iter)
                 }
                 #[cfg(target_os = "linux")]
                 Source::Netlink(socket) => netlink::recv(socket, &mut buf, interface),
@@ -325,6 +347,7 @@ mod sys {
                     for update in updates {
                         #[cfg(feature = "tracing")]
                         tracing::debug!(?update, interface, "RA DNS servers");
+                        answered = true;
                         shared.apply(update);
                     }
                 }
@@ -357,8 +380,9 @@ mod sys {
         Ok(())
     }
 
-    /// Receives one ICMPv6 packet, returning an update if it is a valid RA with RDNSS on `interface`.
-    fn recv_ra(fd: RawFd, buf: &mut [u8], interface: &str) -> io::Result<Option<Update>> {
+    /// Receives one ICMPv6 packet, returning an update if it is a valid RA with RDNSS that
+    /// arrived on the interface with `index` (`None`: absent, so nothing matches).
+    fn recv_ra(fd: RawFd, buf: &mut [u8], index: Option<u32>) -> io::Result<Option<Update>> {
         // SAFETY: all-zero is valid for these C structs.
         let mut src: libc::sockaddr_in6 = unsafe { zeroed() };
         let mut iov = libc::iovec {
@@ -397,7 +421,7 @@ mod sys {
         }
 
         // Link-local sources carry the arrival interface as their scope.
-        if src.sin6_scope_id != if_index(interface)? {
+        if Some(src.sin6_scope_id) != index {
             return Ok(None);
         }
         Ok(parse_ra(
@@ -419,7 +443,7 @@ mod sys {
 
         use super::super::{ND_ROUTER_ADVERT, Update, parse_rdnss};
         use super::RECV_TIMEOUT;
-        use crate::custom::{if_index, setsockopt_int};
+        use crate::custom::{if_index, setsockopt};
 
         const NETLINK_ADD_MEMBERSHIP: libc::c_int = 1;
         const NDUSEROPT_SRCADDR: u16 = 1;
@@ -444,11 +468,11 @@ mod sys {
             if ret != 0 {
                 return Err(io::Error::last_os_error());
             }
-            setsockopt_int(
+            setsockopt(
                 socket.as_raw_fd(),
                 libc::SOL_NETLINK,
                 NETLINK_ADD_MEMBERSHIP,
-                libc::RTNLGRP_ND_USEROPT as _,
+                &(libc::RTNLGRP_ND_USEROPT as libc::c_int),
             )?;
             socket.set_read_timeout(Some(RECV_TIMEOUT))?;
             Ok(socket)
@@ -646,6 +670,19 @@ mod tests {
         // Lifetime 0 withdraws.
         state.apply(update(&[(DNS1, 0)], true), now);
         assert!(state.current(now).is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn filter_passes_only_ra() {
+        let filter = sys::ra_only_filter();
+        assert_eq!(filter[4], !(1 << 6)); // 134 = 4 * 32 + 6
+        assert!(
+            filter
+                .iter()
+                .enumerate()
+                .all(|(i, w)| i == 4 || *w == u32::MAX)
+        );
     }
 
     #[cfg(target_os = "linux")]

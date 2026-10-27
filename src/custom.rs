@@ -9,7 +9,7 @@ use std::task::{Context, Poll, ready};
 use std::time::Duration;
 
 use fqdn::FQDN;
-use hickory_resolver::config::{NameServerConfig, ResolverConfig};
+use hickory_resolver::config::{NameServerConfig, ResolveHosts, ResolverConfig};
 use hickory_resolver::net::runtime::iocompat::AsyncIoTokioAsStd;
 use hickory_resolver::net::runtime::{
     DnsUdpSocket, RuntimeProvider, TokioHandle, TokioRuntimeProvider, TokioTime,
@@ -111,11 +111,13 @@ impl StaticResolverConfig {
         runtime()?.spawn(async move {
             // shortcut: a fresh resolver per lookup means no hickory cache; keep one per config if query volume matters.
             // Built inside the runtime: hickory spawns background tasks on build.
-            let res =
-                match hickory_resolver::Resolver::builder_with_config(config, provider).build() {
-                    Ok(resolver) => resolver.lookup_ip(name).await,
-                    Err(e) => Err(e),
-                };
+            let mut builder = hickory_resolver::Resolver::builder_with_config(config, provider);
+            // Only the nameservers answer; hickory would otherwise read the hosts file on every build.
+            builder.options_mut().use_hosts_file = ResolveHosts::Never;
+            let res = match builder.build() {
+                Ok(resolver) => resolver.lookup_ip(name).await,
+                Err(e) => Err(e),
+            };
             let _ = tx.send(res.map(|lookup| lookup.iter().collect()));
         });
         rx.recv()
@@ -159,16 +161,16 @@ pub(crate) fn lookup_on_interface(
         .lookup(fqdn)
 }
 
-/// `setsockopt(2)` with an `int` value, for options socket2 lacks.
+/// `setsockopt(2)` for options socket2 lacks.
 #[cfg(all(
     unix,
     any(feature = "ra", target_os = "openbsd", target_os = "freebsd")
 ))]
-pub(crate) fn setsockopt_int(
+pub(crate) fn setsockopt<T>(
     fd: std::os::fd::RawFd,
     level: libc::c_int,
     name: libc::c_int,
-    value: libc::c_int,
+    value: &T,
 ) -> io::Result<()> {
     // SAFETY: `value` outlives the call with the given length.
     let ret = unsafe {
@@ -176,8 +178,8 @@ pub(crate) fn setsockopt_int(
             fd,
             level,
             name,
-            (&raw const value).cast(),
-            size_of::<libc::c_int>() as libc::socklen_t,
+            std::ptr::from_ref(value).cast(),
+            size_of::<T>() as libc::socklen_t,
         )
     };
     if ret == 0 {
@@ -355,11 +357,11 @@ mod rtable {
     const _: () = assert!(SIOCGIFFIB == 0xc020_695c);
 
     pub(super) fn set(socket: &SockRef<'_>, table: u32) -> io::Result<()> {
-        super::setsockopt_int(
+        super::setsockopt(
             socket.as_raw_fd(),
             libc::SOL_SOCKET,
             SO_RTABLE,
-            table as c_int,
+            &(table as c_int),
         )
     }
 
@@ -536,6 +538,10 @@ mod tests {
     fn lookup_via_static_resolver() {
         let config = StaticResolverConfig::new([fake_dns_server()]);
         let addrs = config.lookup(&"example.test".parse().unwrap()).unwrap();
+        assert_eq!(addrs, vec![IpAddr::V4(Ipv4Addr::new(192, 0, 2, 7))]);
+        // Not from the hosts file either (`ip6-localhost` is `::1` in Debian's default one;
+        // `localhost` itself is answered locally per RFC 6761): only the nameserver answers.
+        let addrs = config.lookup(&"ip6-localhost".parse().unwrap()).unwrap();
         assert_eq!(addrs, vec![IpAddr::V4(Ipv4Addr::new(192, 0, 2, 7))]);
     }
 
