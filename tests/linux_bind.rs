@@ -1,4 +1,4 @@
-//! Linux interface / VRF binding tests. They need the network set up by `tests/linux-bind.sh`,
+//! Linux interface / VRF binding and RA tests. They need the network set up by `tests/linux-bind.sh`,
 //! which runs them in a privileged Docker container.
 #![cfg(all(target_os = "linux", feature = "custom"))]
 
@@ -98,6 +98,32 @@ fn vrf_tcp_fallback() {
 fn vrf_unbound_fails() {
     let config = StaticResolverConfig::new(["10.98.0.2:53".parse().unwrap()]);
     assert!(resolve("example.test", config).is_empty());
+}
+
+/// Run twice by the script: as root with `accept_ra=0` and a router that only answers
+/// solicitations (raw socket path), and as nobody with `accept_ra=2` and periodic RAs (netlink path).
+#[cfg(feature = "ra")]
+#[test]
+#[ignore = "needs tests/linux-bind.sh"]
+fn ra_resolver() {
+    use std::time::{Duration, Instant};
+
+    let config = iphost::RaResolverConfig::new("ve0").unwrap();
+    let resolver = IpHostResolver::new_with_config("example.test".parse().unwrap(), false, false)
+        .with_resolver(Resolver::Ra(config.clone()));
+    let deadline = Instant::now() + Duration::from_secs(20);
+    // Each attempt waits a few seconds for the first RA.
+    let addrs = loop {
+        let addrs = resolver.resolve();
+        if !addrs.is_empty() || Instant::now() > deadline {
+            break addrs;
+        }
+    };
+    assert_eq!(addrs, vec![VIA_INTERFACE]);
+    assert_eq!(
+        config.nameservers(),
+        vec!["2001:db8:99::2".parse::<std::net::Ipv6Addr>().unwrap()]
+    );
 }
 
 /// The resolver can be swapped at runtime.

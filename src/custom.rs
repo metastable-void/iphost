@@ -139,8 +139,33 @@ fn runtime() -> io::Result<&'static tokio::runtime::Runtime> {
         .map_err(|e| io::Error::new(e.kind(), e.to_string()))
 }
 
+/// `setsockopt(2)` with an `int` value, for options socket2 lacks.
 #[cfg(unix)]
-fn if_index(name: &str) -> io::Result<u32> {
+pub(crate) fn setsockopt_int(
+    fd: std::os::fd::RawFd,
+    level: libc::c_int,
+    name: libc::c_int,
+    value: libc::c_int,
+) -> io::Result<()> {
+    // SAFETY: `value` outlives the call with the given length.
+    let ret = unsafe {
+        libc::setsockopt(
+            fd,
+            level,
+            name,
+            (&raw const value).cast(),
+            size_of::<libc::c_int>() as libc::socklen_t,
+        )
+    };
+    if ret == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+#[cfg(unix)]
+pub(crate) fn if_index(name: &str) -> io::Result<u32> {
     let name = std::ffi::CString::new(name)
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "NUL in interface name"))?;
     // SAFETY: `name` is a valid NUL-terminated string.
@@ -151,7 +176,7 @@ fn if_index(name: &str) -> io::Result<u32> {
 }
 
 #[cfg(not(unix))]
-fn if_index(_name: &str) -> io::Result<u32> {
+pub(crate) fn if_index(_name: &str) -> io::Result<u32> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
         "interface binding is not supported on this platform",
@@ -277,22 +302,12 @@ mod rtable {
     const _: () = assert!(SIOCGIFFIB == 0xc020_695c);
 
     pub(super) fn set(socket: &SockRef<'_>, table: u32) -> io::Result<()> {
-        let value = table as c_int;
-        // SAFETY: valid fd, and `value` outlives the call with the given length.
-        let ret = unsafe {
-            libc::setsockopt(
-                socket.as_raw_fd(),
-                libc::SOL_SOCKET,
-                SO_RTABLE,
-                (&raw const value).cast(),
-                size_of::<c_int>() as libc::socklen_t,
-            )
-        };
-        if ret == 0 {
-            Ok(())
-        } else {
-            Err(io::Error::last_os_error())
-        }
+        super::setsockopt_int(
+            socket.as_raw_fd(),
+            libc::SOL_SOCKET,
+            SO_RTABLE,
+            table as c_int,
+        )
     }
 
     /// Routing table of an interface, queried via any socket.

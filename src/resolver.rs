@@ -20,6 +20,11 @@ pub enum Resolver {
     #[cfg(feature = "custom")]
     #[cfg_attr(docsrs, doc(cfg(feature = "custom")))]
     Static(crate::StaticResolverConfig),
+
+    /// DNS servers advertised by IPv6 routers (RDNSS).
+    #[cfg(feature = "ra")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "ra")))]
+    Ra(crate::RaResolverConfig),
 }
 
 impl Resolver {
@@ -32,6 +37,8 @@ impl Resolver {
                 .collect()),
             #[cfg(feature = "custom")]
             Resolver::Static(config) => config.lookup(fqdn),
+            #[cfg(feature = "ra")]
+            Resolver::Ra(config) => config.lookup(fqdn),
         }
     }
 }

@@ -16,6 +16,7 @@ serde = ["dep:serde"]
 tracing = ["dep:tracing"]
 broadcast = ["dep:tokio"]
 custom = ["dep:hickory-resolver", "dep:tokio", "tokio/net", "tokio/rt-multi-thread", "tokio/time", "dep:socket2", "dep:libc"]
+ra = ["custom"]
 
 [dependencies]
 tokio = { version = "1", default-features = false, features = ["sync"], optional = true }
