@@ -1,19 +1,16 @@
-use std::{
-    net::{Ipv4Addr, Ipv6Addr},
-    time::Duration,
-};
-
-use dropcatch::DropCatcher;
+use std::net::{Ipv4Addr, Ipv6Addr};
+use std::sync::mpsc;
+use std::time::Duration;
 
 #[cfg(feature = "broadcast")]
-use tokio::sync::{broadcast, oneshot};
+use tokio::sync::broadcast;
 
-#[cfg(not(feature = "broadcast"))]
-use std::sync::mpsc;
+use crate::{IpHost, IpHostResolver, Resolver};
 
+/// Changes to the stored addresses. `None` means unchanged; `Some(None)` means the address was removed.
 #[cfg(feature = "broadcast")]
 #[cfg_attr(docsrs, doc(cfg(feature = "broadcast")))]
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct IpChanges {
     v4_change: Option<Option<Ipv4Addr>>,
     v6_change: Option<Option<Ipv6Addr>>,
@@ -22,13 +19,6 @@ pub struct IpChanges {
 #[cfg(feature = "broadcast")]
 #[cfg_attr(docsrs, doc(cfg(feature = "broadcast")))]
 impl IpChanges {
-    fn new(v4_change: Option<Option<Ipv4Addr>>, v6_change: Option<Option<Ipv6Addr>>) -> Self {
-        Self {
-            v4_change,
-            v6_change,
-        }
-    }
-
     pub fn is_none(&self) -> bool {
         self.v4_change.is_none() && self.v6_change.is_none()
     }
@@ -49,16 +39,47 @@ impl IpChanges {
 /// Spawn a background thread to do hostname resolutions automatically.
 ///
 /// You can check the resolved values later after you started this.
+/// The thread exits when the last clone of this is dropped.
 #[derive(Debug, Clone)]
 pub struct AutoIpHostResolver {
-    inner: super::IpHostResolver,
-    _on_drop: DropCatcher,
+    inner: IpHostResolver,
+    /// Never sent on; the worker exits when every clone of this is dropped.
+    _shutdown: mpsc::Sender<()>,
 
     #[cfg(feature = "broadcast")]
     bc_pub: broadcast::Sender<IpChanges>,
 }
 
 impl AutoIpHostResolver {
+    /// Starts resolving `ip_host` every `refresh_interval`, with the default [`IpHostResolver`] configuration.
+    pub fn new(ip_host: IpHost, refresh_interval: Duration) -> Self {
+        Self::from_resolver(IpHostResolver::new(ip_host), refresh_interval)
+    }
+
+    /// Starts resolving with a preconfigured [`IpHostResolver`] every `refresh_interval`.
+    pub fn from_resolver(inner: IpHostResolver, refresh_interval: Duration) -> Self {
+        let (shutdown, shutdown_rx) = mpsc::channel();
+
+        #[cfg(feature = "broadcast")]
+        let (bc_pub, _) = broadcast::channel(16);
+
+        let worker = Worker {
+            inner: inner.clone(),
+            shutdown_rx,
+            interval: refresh_interval,
+            #[cfg(feature = "broadcast")]
+            bc_pub: bc_pub.clone(),
+        };
+        std::thread::spawn(move || worker.run());
+
+        Self {
+            inner,
+            _shutdown: shutdown,
+            #[cfg(feature = "broadcast")]
+            bc_pub,
+        }
+    }
+
     pub fn ipv4_addr(&self) -> Option<Ipv4Addr> {
         self.inner.ipv4_addr()
     }
@@ -67,201 +88,155 @@ impl AutoIpHostResolver {
         self.inner.ipv6_addr()
     }
 
-    pub fn replace_ip_host(&self, ip_host: super::IpHost) -> Result<super::IpHost, super::IpHost> {
+    pub fn ip_host(&self) -> IpHost {
+        self.inner.ip_host()
+    }
+
+    pub fn replace_ip_host(&self, ip_host: IpHost) -> IpHost {
         self.inner.replace_ip_host(ip_host)
     }
 
-    pub fn new(ip_host: super::IpHost, refresh_interval: Duration) -> Self {
-        #[cfg(not(feature = "broadcast"))]
-        let (tx, rx) = mpsc::channel();
-
-        #[cfg(feature = "broadcast")]
-        let (tx, rx) = oneshot::channel();
-
-        #[cfg(feature = "broadcast")]
-        let (bc_pub, _) = broadcast::channel(16);
-
-        let on_drop = DropCatcher::new(move || {
-            if tx.send(()).is_err() {
-                #[cfg(feature = "tracing")]
-                tracing::warn!("Worker thread exited for some reason, before me");
-            };
-        });
-
-        #[cfg(feature = "broadcast")]
-        let bc_pub_clone = bc_pub.clone();
-
-        let me = Self {
-            inner: super::IpHostResolver::new_with_config(ip_host, true, false),
-            _on_drop: on_drop,
-
-            #[cfg(feature = "broadcast")]
-            bc_pub: bc_pub_clone,
-        };
-
-        me.start_worker(
-            rx,
-            refresh_interval,
-            #[cfg(feature = "broadcast")]
-            bc_pub,
-        );
-
-        me
+    pub fn resolver(&self) -> Resolver {
+        self.inner.resolver()
     }
 
-    fn start_worker(
-        &self,
-
-        #[cfg(not(feature = "broadcast"))] on_drop_receiver: mpsc::Receiver<()>,
-
-        #[cfg(feature = "broadcast")] mut on_drop_receiver: oneshot::Receiver<()>,
-
-        interval: Duration,
-
-        #[cfg(feature = "broadcast")] bc_pub: broadcast::Sender<IpChanges>,
-    ) {
-        let inner_clone = self.inner.clone();
-        std::thread::spawn(move || {
-            #[cfg(feature = "broadcast")]
-            let mut ipv4_addr = None;
-
-            #[cfg(feature = "broadcast")]
-            let mut ipv6_addr = None;
-
-            loop {
-                #[cfg(feature = "broadcast")]
-                match on_drop_receiver.try_recv() {
-                    Ok(_) => break,
-                    Err(oneshot::error::TryRecvError::Closed) => break,
-                    Err(_) => {}
-                }
-
-                #[cfg(not(feature = "broadcast"))]
-                match on_drop_receiver.try_recv() {
-                    Ok(_) => break,
-                    Err(mpsc::TryRecvError::Disconnected) => break,
-                    Err(_) => {}
-                }
-
-                #[allow(unused_variables)]
-                let res = inner_clone.resolve();
-
-                #[cfg(feature = "tracing")]
-                for ip in res {
-                    tracing::trace!(resolved_ip = %ip, "Hostname resolved");
-                }
-
-                #[cfg(feature = "broadcast")]
-                {
-                    let new_v4_addr = inner_clone.ipv4_addr();
-                    let v4_changed;
-                    if new_v4_addr != ipv4_addr {
-                        v4_changed = true;
-                        ipv4_addr = new_v4_addr;
-                    } else {
-                        v4_changed = false;
-                    }
-
-                    let new_v6_addr = inner_clone.ipv6_addr();
-                    let v6_changed;
-                    if new_v6_addr != ipv6_addr {
-                        v6_changed = true;
-                        ipv6_addr = new_v6_addr;
-                    } else {
-                        v6_changed = false;
-                    }
-
-                    #[cfg(feature = "tracing")]
-                    {
-                        if v4_changed {
-                            if let Some(v4) = ipv4_addr {
-                                tracing::debug!(ipv4 = %v4, "IP address change");
-                            } else {
-                                tracing::debug!(ipv4 = %"(none)", "IP address change");
-                            }
-                        }
-                        if v6_changed {
-                            if let Some(v6) = ipv6_addr {
-                                tracing::debug!(ipv6 = %v6, "IP address change");
-                            } else {
-                                tracing::debug!(ipv6 = %"(none)", "IP address change");
-                            }
-                        }
-                    }
-
-                    let change = match (v4_changed, v6_changed) {
-                        (true, true) => IpChanges::new(Some(ipv4_addr), Some(ipv6_addr)),
-                        (true, false) => IpChanges::new(Some(ipv4_addr), None),
-                        (false, true) => IpChanges::new(None, Some(ipv6_addr)),
-                        _ => IpChanges::new(None, None),
-                    };
-
-                    if change.is_some() {
-                        let _ = bc_pub.send(change);
-                    }
-                }
-
-                std::thread::sleep(interval);
-            }
-
-            #[cfg(feature = "tracing")]
-            tracing::info!("Consumer dropped. Exiting resolution thread.");
-        });
+    pub fn set_resolver(&self, resolver: Resolver) -> Resolver {
+        self.inner.set_resolver(resolver)
     }
 
+    /// Subscribes to address changes from now on.
     #[cfg(feature = "broadcast")]
     #[cfg_attr(docsrs, doc(cfg(feature = "broadcast")))]
     pub fn subscribe_changes(&self) -> IpHostSubscriber {
         IpHostSubscriber {
-            tx: self.bc_pub.clone(),
+            rx: self.bc_pub.subscribe(),
         }
+    }
+}
+
+struct Worker {
+    inner: IpHostResolver,
+    shutdown_rx: mpsc::Receiver<()>,
+    interval: Duration,
+    #[cfg(feature = "broadcast")]
+    bc_pub: broadcast::Sender<IpChanges>,
+}
+
+impl Worker {
+    fn run(self) {
+        let mut v4_addr = None;
+        let mut v6_addr = None;
+
+        loop {
+            #[allow(unused_variables)]
+            let res = self.inner.resolve();
+
+            #[cfg(feature = "tracing")]
+            for ip in res {
+                tracing::trace!(resolved_ip = %ip, "Hostname resolved");
+            }
+
+            let new_v4_addr = self.inner.ipv4_addr();
+            let v4_change = (new_v4_addr != v4_addr).then_some(new_v4_addr);
+            v4_addr = new_v4_addr;
+
+            let new_v6_addr = self.inner.ipv6_addr();
+            let v6_change = (new_v6_addr != v6_addr).then_some(new_v6_addr);
+            v6_addr = new_v6_addr;
+
+            #[cfg(feature = "tracing")]
+            {
+                if let Some(v4) = v4_change {
+                    tracing::debug!(ipv4 = ?v4, "IP address change");
+                }
+                if let Some(v6) = v6_change {
+                    tracing::debug!(ipv6 = ?v6, "IP address change");
+                }
+            }
+
+            #[cfg(feature = "broadcast")]
+            if v4_change.is_some() || v6_change.is_some() {
+                // Err only means there are no subscribers right now.
+                let _ = self.bc_pub.send(IpChanges {
+                    v4_change,
+                    v6_change,
+                });
+            }
+            #[cfg(not(feature = "broadcast"))]
+            let _ = (v4_change, v6_change);
+
+            match self.shutdown_rx.recv_timeout(self.interval) {
+                Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                _ => break,
+            }
+        }
+
+        #[cfg(feature = "tracing")]
+        tracing::info!("Consumer dropped. Exiting resolution thread.");
     }
 }
 
 /// Subscriber to IP address changes.
 #[cfg(feature = "broadcast")]
 #[cfg_attr(docsrs, doc(cfg(feature = "broadcast")))]
+#[derive(Debug)]
 pub struct IpHostSubscriber {
-    tx: broadcast::Sender<IpChanges>,
+    rx: broadcast::Receiver<IpChanges>,
 }
 
 #[cfg(feature = "broadcast")]
 #[cfg_attr(docsrs, doc(cfg(feature = "broadcast")))]
 impl IpHostSubscriber {
     /// Wait for next IP address changes, blocking the current thread.
-    /// 
-    /// Returns None if the resolver is dropped for some reason.
     ///
-    /// This function is safe to be called from an async context, like `tokio::task::spawn_blocking()`.
-    pub fn wait_for_change_blocking(&self) -> Option<IpChanges> {
+    /// Changes that happen between calls are not lost (up to a small buffer).
+    /// Returns None once the resolver is dropped.
+    ///
+    /// This MUST NOT be called from an async task directly; use `tokio::task::spawn_blocking()`.
+    pub fn wait_for_change_blocking(&mut self) -> Option<IpChanges> {
         loop {
-            let mut rx = self.tx.subscribe();
-
-            // We spawn a thread to make a call from an async context possible
-            // (i.e. tokio::task::spawn_blocking()).
-            let join = std::thread::spawn(move || rx.blocking_recv()).join();
-            let res = match join {
-                Ok(v) => v,
-                _ => {
+            match self.rx.blocking_recv() {
+                Ok(v) => return Some(v),
+                Err(broadcast::error::RecvError::Closed) => return None,
+                Err(broadcast::error::RecvError::Lagged(_n)) => {
                     #[cfg(feature = "tracing")]
-                    tracing::error!("Event receiver thread panicked");
-                    continue;
+                    tracing::warn!("Event receiver lagged too much, discarding {} messages", _n);
                 }
-            };
-
-            #[allow(unreachable_patterns)]
-            let val = match res {
-                Err(broadcast::error::RecvError::Closed) => None,
-                Err(broadcast::error::RecvError::Lagged(n)) => {
-                    #[cfg(feature = "tracing")]
-                    tracing::warn!("Event receiver lagged too much, discarding {} messages", n);
-                    continue;
-                }
-                Ok(v) => Some(v),
-                _ => None,
-            };
-
-            return val;
+            }
         }
+    }
+}
+
+#[cfg(all(test, feature = "broadcast"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn subscriber_closes_after_drop() {
+        let resolver = AutoIpHostResolver::new(
+            IpHost::V4Addr(Ipv4Addr::LOCALHOST),
+            Duration::from_millis(10),
+        );
+        let mut sub = resolver.subscribe_changes();
+        drop(resolver);
+        // Drains any initial change, then sees the channel close once the worker exits.
+        while sub.wait_for_change_blocking().is_some() {}
+    }
+
+    #[test]
+    fn wait_works_inside_spawn_blocking() {
+        let rt = tokio::runtime::Builder::new_multi_thread().build().unwrap();
+        rt.block_on(async {
+            let resolver = AutoIpHostResolver::new(
+                IpHost::V4Addr(Ipv4Addr::LOCALHOST),
+                Duration::from_millis(10),
+            );
+            let mut sub = resolver.subscribe_changes();
+            resolver.replace_ip_host(IpHost::V4Addr(Ipv4Addr::new(192, 0, 2, 1)));
+            let change = tokio::task::spawn_blocking(move || sub.wait_for_change_blocking())
+                .await
+                .unwrap();
+            assert!(change.is_some());
+        });
     }
 }

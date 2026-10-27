@@ -72,7 +72,7 @@ fn main() {
 
     #[cfg(feature = "broadcast")]
     {
-        let subscriber = resolver.subscribe_changes();
+        let mut subscriber = resolver.subscribe_changes();
         loop {
             if let Some(changes) = subscriber.wait_for_change_blocking() {
                 if let Some(v4_change) = changes.v4_change() {
