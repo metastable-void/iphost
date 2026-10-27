@@ -1,13 +1,14 @@
 //! DNS servers from whichever IPv6 configuration source is available (`ra` or `dhcpv6` feature).
 
 use std::io;
-use std::net::{IpAddr, Ipv6Addr};
+use std::net::Ipv6Addr;
 use std::time::{Duration, Instant};
 
 use fqdn::FQDN;
 
 use crate::ClientId;
 use crate::custom::{DISCOVERY_TIMEOUT, lookup_on_interface};
+use crate::resolver::Lookup;
 
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
 
@@ -117,7 +118,7 @@ impl Ipv6ResolverConfig {
             .unwrap_or_default()
     }
 
-    pub(crate) fn lookup(&self, fqdn: &FQDN) -> io::Result<Vec<IpAddr>> {
+    pub(crate) fn lookup(&self, fqdn: &FQDN) -> io::Result<Lookup> {
         // shortcut: polls instead of waiting on the sources' condvars; fine for a short startup wait.
         let deadline = Instant::now() + DISCOVERY_TIMEOUT;
         loop {

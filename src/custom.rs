@@ -8,6 +8,8 @@ use std::time::{Duration, Instant};
 use fqdn::FQDN;
 use socket2::{Domain, Protocol, SockRef, Socket, Type};
 
+use crate::resolver::Lookup;
+
 /// Per nameserver and attempt: the UDP exchange plus any TCP retry after truncation.
 pub(crate) const QUERY_TIMEOUT: Duration = Duration::from_secs(5);
 /// Passes over the nameserver list.
@@ -106,7 +108,7 @@ impl StaticResolverConfig {
     }
 
     /// Blocking lookup: A and AAAA records, queried in parallel.
-    pub(crate) fn lookup(&self, fqdn: &FQDN) -> io::Result<Vec<IpAddr>> {
+    pub(crate) fn lookup(&self, fqdn: &FQDN) -> io::Result<Lookup> {
         if self.nameservers.is_empty() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -127,6 +129,12 @@ impl StaticResolverConfig {
             });
             (v6, v4)
         });
+        // NXDOMAIN settles its family; any other error leaves the family unknown.
+        let failed = |r: &io::Result<Vec<IpAddr>>| {
+            r.as_ref()
+                .is_err_and(|e| e.kind() != io::ErrorKind::NotFound)
+        };
+        let (v4_failed, v6_failed) = (failed(&v4), failed(&v6));
         let addrs: Vec<IpAddr> = match (v6, v4) {
             (Err(e), Err(_)) => return Err(e),
             (v6, v4) => v6
@@ -135,14 +143,18 @@ impl StaticResolverConfig {
                 .chain(v4.into_iter().flatten())
                 .collect(),
         };
-        if addrs.is_empty() {
+        if addrs.is_empty() && !v4_failed && !v6_failed {
             // As with `getaddrinfo`, a name without address records is an error.
             return Err(io::Error::new(
                 io::ErrorKind::NotFound,
                 "no address records",
             ));
         }
-        Ok(addrs)
+        Ok(Lookup {
+            addrs,
+            v4_failed,
+            v6_failed,
+        })
     }
 
     /// `qtype` records from the first nameserver that answers, trying the list [`ATTEMPTS`] times.
@@ -406,7 +418,7 @@ pub(crate) fn lookup_on_interface(
     interface: &str,
     fqdn: &FQDN,
     source: &str,
-) -> io::Result<Vec<IpAddr>> {
+) -> io::Result<Lookup> {
     if servers.is_empty() {
         return Err(io::Error::new(
             io::ErrorKind::NotFound,
@@ -610,10 +622,17 @@ mod rtable {
 mod tests {
     use super::*;
     use std::net::{SocketAddrV6, TcpListener};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU16, Ordering};
+
+    use crate::{IpHostResolver, Resolver};
 
     const EXAMPLE: &[u8] = b"\x07example\x04test\0";
     const BIG: &[u8] = b"\x03big\x04test\0";
+    const V6FAIL: &[u8] = b"\x06v6fail\x04test\0";
+    const DUAL: &[u8] = b"\x04dual\x04test\0";
     const ADDR: Ipv4Addr = Ipv4Addr::new(192, 0, 2, 7);
+    const V6: Ipv6Addr = Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 7);
     const OK: [u8; 2] = [0x81, 0x80]; // QR, RD, RA
 
     #[test]
@@ -734,23 +753,28 @@ mod tests {
     }
 
     /// A reply from the fake server: `example.test` has 192.0.2.7, `big.test` three addresses
-    /// (truncated over UDP), `nx.test` does not exist, other names have no records.
-    fn answer(query: &[u8], tcp: bool, servfail: bool) -> Vec<u8> {
+    /// (truncated over UDP), `nx.test` does not exist, `v6fail.test` has 192.0.2.7 but its AAAA
+    /// queries fail, `dual.test` has 192.0.2.7 and 2001:db8::7, other names have no records.
+    /// Queries of type `down` fail.
+    fn answer(query: &[u8], tcp: bool, servfail: bool, down: u16) -> Vec<u8> {
         let name_end = 12 + query[12..].iter().position(|&b| b == 0).unwrap() + 1;
         let qname = &query[12..name_end];
         let qtype = u16::from_be_bytes([query[name_end], query[name_end + 1]]);
         let truncated = !tcp && qname == BIG;
         let rcode = match (servfail, qname) {
             (true, _) => 2,
+            (false, _) if qtype == down => 2,
             (false, b"\x02nx\x04test\0") => RCODE_NXDOMAIN,
+            (false, V6FAIL) if qtype == TYPE_AAAA => 2,
             _ => 0,
         };
-        let addrs: &[Ipv4Addr] = match (qname, qtype, truncated || rcode != 0) {
-            (EXAMPLE, TYPE_A, false) => &[ADDR],
+        let addrs: &[IpAddr] = match (qname, qtype, truncated || rcode != 0) {
+            (EXAMPLE | V6FAIL | DUAL, TYPE_A, false) => &[IpAddr::V4(ADDR)],
+            (DUAL, TYPE_AAAA, false) => &[IpAddr::V6(V6)],
             (BIG, TYPE_A, false) => &[
-                Ipv4Addr::new(192, 0, 2, 1),
-                Ipv4Addr::new(192, 0, 2, 2),
-                Ipv4Addr::new(192, 0, 2, 3),
+                IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)),
+                IpAddr::V4(Ipv4Addr::new(192, 0, 2, 2)),
+                IpAddr::V4(Ipv4Addr::new(192, 0, 2, 3)),
             ],
             _ => &[],
         };
@@ -761,13 +785,22 @@ mod tests {
         msg.extend([0, 0, 0, 0]);
         msg.extend_from_slice(&query[12..name_end + 4]);
         for a in addrs {
-            msg.extend(record(TYPE_A, &a.octets()));
+            msg.extend(match a {
+                IpAddr::V4(a) => record(TYPE_A, &a.octets()),
+                IpAddr::V6(a) => record(TYPE_AAAA, &a.octets()),
+            });
         }
         msg
     }
 
     /// A nameserver on UDP and TCP at one loopback port; see [`answer`].
     fn fake_server(servfail: bool) -> SocketAddr {
+        fake_server_with_down(servfail, Arc::default())
+    }
+
+    /// [`fake_server`] failing queries of the type in `down` (0 for none).
+    fn fake_server_with_down(servfail: bool, down: Arc<AtomicU16>) -> SocketAddr {
+        let tcp_down = down.clone();
         let (udp, tcp) = loop {
             let tcp = TcpListener::bind("127.0.0.1:0").unwrap();
             if let Ok(udp) = UdpSocket::bind(tcp.local_addr().unwrap()) {
@@ -778,8 +811,8 @@ mod tests {
         std::thread::spawn(move || {
             let mut buf = [0u8; 512];
             while let Ok((len, src)) = udp.recv_from(&mut buf) {
-                udp.send_to(&answer(&buf[..len], false, servfail), src)
-                    .unwrap();
+                let reply = answer(&buf[..len], false, servfail, down.load(Ordering::Relaxed));
+                udp.send_to(&reply, src).unwrap();
             }
         });
         std::thread::spawn(move || {
@@ -789,7 +822,7 @@ mod tests {
                 stream.read_exact(&mut len).unwrap();
                 let mut query = vec![0u8; usize::from(u16::from_be_bytes(len))];
                 stream.read_exact(&mut query).unwrap();
-                let reply = answer(&query, true, servfail);
+                let reply = answer(&query, true, servfail, tcp_down.load(Ordering::Relaxed));
                 stream
                     .write_all(&[&(reply.len() as u16).to_be_bytes()[..], &reply].concat())
                     .unwrap();
@@ -799,7 +832,67 @@ mod tests {
     }
 
     fn lookup(config: &StaticResolverConfig, name: &str) -> io::Result<Vec<IpAddr>> {
-        config.lookup(&name.parse().unwrap())
+        config.lookup(&name.parse().unwrap()).map(|l| l.addrs)
+    }
+
+    #[test]
+    fn failed_family_is_marked() {
+        let config = StaticResolverConfig::new([fake_server(false)]);
+        let l = config.lookup(&"v6fail.test".parse().unwrap()).unwrap();
+        assert_eq!(l.addrs, vec![IpAddr::V4(ADDR)]);
+        assert!(l.v6_failed && !l.v4_failed);
+        // NODATA (here for AAAA) answers for its family.
+        let l = config.lookup(&"example.test".parse().unwrap()).unwrap();
+        assert!(!l.v6_failed && !l.v4_failed);
+    }
+
+    #[test]
+    fn failure_beside_nodata_is_not_an_error() {
+        let down = Arc::new(AtomicU16::new(TYPE_A));
+        let config = StaticResolverConfig::new([fake_server_with_down(false, down)]);
+        // AAAA is NODATA, A fails: no addresses, but not "no address records".
+        let l = config.lookup(&"example.test".parse().unwrap()).unwrap();
+        assert!(l.addrs.is_empty());
+        assert!(l.v4_failed && !l.v6_failed);
+    }
+
+    /// A resolver for `dual.test` on a fake server, and the server's `down` switch.
+    fn dual_resolver(use_cached_on_error: bool) -> (IpHostResolver, Arc<AtomicU16>) {
+        let down = Arc::new(AtomicU16::new(0));
+        let config = StaticResolverConfig::new([fake_server_with_down(false, down.clone())]);
+        let resolver = IpHostResolver::new_with_config(
+            "dual.test".parse().unwrap(),
+            use_cached_on_error,
+            false,
+        )
+        .with_resolver(Resolver::Static(config));
+        (resolver, down)
+    }
+
+    #[test]
+    fn failed_family_keeps_cache() {
+        let (resolver, down) = dual_resolver(true);
+        assert_eq!(resolver.resolve(), [IpAddr::V6(V6), IpAddr::V4(ADDR)]);
+
+        down.store(TYPE_A, Ordering::Relaxed);
+        assert_eq!(resolver.resolve(), [IpAddr::V6(V6), IpAddr::V4(ADDR)]);
+        assert_eq!(resolver.ipv4_addr(), Some(ADDR));
+
+        down.store(TYPE_AAAA, Ordering::Relaxed);
+        assert_eq!(resolver.resolve(), [IpAddr::V4(ADDR), IpAddr::V6(V6)]);
+        assert_eq!(resolver.ipv6_addr(), Some(V6));
+    }
+
+    #[test]
+    fn failed_family_cache_not_returned_without_use_cached_on_error() {
+        let (resolver, down) = dual_resolver(false);
+        resolver.resolve();
+
+        down.store(TYPE_A, Ordering::Relaxed);
+        assert_eq!(resolver.resolve(), [IpAddr::V6(V6)]);
+        // Kept, as after a failed lookup, though not returned.
+        assert_eq!(resolver.ipv4_addr(), Some(ADDR));
+        assert_eq!(resolver.ipv6_addr(), Some(V6));
     }
 
     #[test]

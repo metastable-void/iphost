@@ -61,12 +61,16 @@ impl Resolver {
     }
 
     /// Blocking lookup. MUST NOT require the caller to be outside of (or inside) a tokio runtime.
-    fn lookup(&self, fqdn: &FQDN) -> io::Result<Vec<IpAddr>> {
+    fn lookup(&self, fqdn: &FQDN) -> io::Result<Lookup> {
         match self {
-            Resolver::System => Ok((fqdn.to_string(), 0)
-                .to_socket_addrs()?
-                .map(|a| a.ip())
-                .collect()),
+            Resolver::System => Ok(Lookup {
+                addrs: (fqdn.to_string(), 0)
+                    .to_socket_addrs()?
+                    .map(|a| a.ip())
+                    .collect(),
+                v4_failed: false,
+                v6_failed: false,
+            }),
             #[cfg(feature = "custom")]
             Resolver::Static(config) => config.lookup(fqdn),
             #[cfg(feature = "ra")]
@@ -77,6 +81,14 @@ impl Resolver {
             Resolver::Ipv6(config) => config.lookup(fqdn),
         }
     }
+}
+
+/// Addresses from a lookup. A family whose query failed while the other's succeeded is marked,
+/// so that its cached address is kept rather than taken as gone.
+pub(crate) struct Lookup {
+    pub(crate) addrs: Vec<IpAddr>,
+    pub(crate) v4_failed: bool,
+    pub(crate) v6_failed: bool,
 }
 
 /// Resolver into IP addresses for a hostname.
@@ -248,8 +260,12 @@ impl IpHostResolver {
             return Self::cached(&state);
         }
 
-        let addrs = match res {
-            Ok(addrs) => addrs,
+        let Lookup {
+            mut addrs,
+            v4_failed,
+            v6_failed,
+        } = match res {
+            Ok(lookup) => lookup,
             Err(_e) => {
                 #[cfg(feature = "tracing")]
                 tracing::debug!(error = %_e, %fqdn, "Resolution failed");
@@ -262,11 +278,16 @@ impl IpHostResolver {
         };
 
         let (v4_cand, v6_cand) = stable_pick(&addrs, state.v4_addr, state.v6_addr);
-        if v4_cand.is_some() || !self.inner.retain_stale_values {
+        // A failed family is handled as a failed lookup is: its cache stays as it was.
+        if !v4_failed && (v4_cand.is_some() || !self.inner.retain_stale_values) {
             state.v4_addr = v4_cand;
         }
-        if v6_cand.is_some() || !self.inner.retain_stale_values {
+        if !v6_failed && (v6_cand.is_some() || !self.inner.retain_stale_values) {
             state.v6_addr = v6_cand;
+        }
+        if self.inner.use_cached_on_error {
+            addrs.extend(state.v6_addr.filter(|_| v6_failed).map(IpAddr::V6));
+            addrs.extend(state.v4_addr.filter(|_| v4_failed).map(IpAddr::V4));
         }
         addrs
     }

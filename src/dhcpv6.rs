@@ -1,7 +1,7 @@
 //! DNS servers from stateless DHCPv6 (`dhcpv6` feature): Information-Request, RFC 8415 section 18.2.6.
 
 use std::io;
-use std::net::{IpAddr, Ipv6Addr, SocketAddr, SocketAddrV6, UdpSocket};
+use std::net::{Ipv6Addr, SocketAddr, SocketAddrV6, UdpSocket};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError, Weak, mpsc};
 use std::time::{Duration, Instant};
 
@@ -12,6 +12,7 @@ use crate::ClientId;
 use crate::custom::{
     DISCOVERY_TIMEOUT, bind_to_interface, if_index, lookup_on_interface, random_u32,
 };
+use crate::resolver::Lookup;
 
 /// Also how often the thread notices that every config was dropped.
 const RECV_TIMEOUT: Duration = Duration::from_secs(1);
@@ -137,7 +138,7 @@ impl Dhcpv6ResolverConfig {
         self.shared.servers().clone().unwrap_or_default()
     }
 
-    pub(crate) fn lookup(&self, fqdn: &FQDN) -> io::Result<Vec<IpAddr>> {
+    pub(crate) fn lookup(&self, fqdn: &FQDN) -> io::Result<Lookup> {
         let servers = {
             let servers = self.shared.servers();
             let (servers, _) = self

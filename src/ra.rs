@@ -3,13 +3,14 @@
 #![cfg_attr(not(unix), allow(dead_code))]
 
 use std::io;
-use std::net::{IpAddr, Ipv6Addr};
+use std::net::Ipv6Addr;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
 use fqdn::FQDN;
 
 use crate::custom::{DISCOVERY_TIMEOUT, lookup_on_interface};
+use crate::resolver::Lookup;
 
 /// Netlink delivers one message per RDNSS option; messages from the same router this close
 /// together are treated as one RA.
@@ -104,7 +105,7 @@ impl RaResolverConfig {
         self.shared.state().current(Instant::now())
     }
 
-    pub(crate) fn lookup(&self, fqdn: &FQDN) -> io::Result<Vec<IpAddr>> {
+    pub(crate) fn lookup(&self, fqdn: &FQDN) -> io::Result<Lookup> {
         let servers = {
             let state = self.shared.state();
             let (state, _) = self
