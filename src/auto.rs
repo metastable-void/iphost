@@ -19,18 +19,22 @@ pub struct IpChanges {
 #[cfg(feature = "broadcast")]
 #[cfg_attr(docsrs, doc(cfg(feature = "broadcast")))]
 impl IpChanges {
+    /// Whether neither address changed.
     pub fn is_none(&self) -> bool {
         self.v4_change.is_none() && self.v6_change.is_none()
     }
 
+    /// Whether at least one address changed.
     pub fn is_some(&self) -> bool {
         !self.is_none()
     }
 
+    /// The new IPv4 address: `None` if unchanged, `Some(None)` if removed.
     pub fn v4_change(&self) -> Option<Option<Ipv4Addr>> {
         self.v4_change
     }
 
+    /// The new IPv6 address: `None` if unchanged, `Some(None)` if removed.
     pub fn v6_change(&self) -> Option<Option<Ipv6Addr>> {
         self.v6_change
     }
@@ -80,26 +84,36 @@ impl AutoIpHostResolver {
         }
     }
 
+    /// The IPv4 address from the latest resolution; see [`IpHostResolver::ipv4_addr`].
     pub fn ipv4_addr(&self) -> Option<Ipv4Addr> {
         self.inner.ipv4_addr()
     }
 
+    /// The IPv6 address from the latest resolution; see [`IpHostResolver::ipv6_addr`].
     pub fn ipv6_addr(&self) -> Option<Ipv6Addr> {
         self.inner.ipv6_addr()
     }
 
+    /// The current hostname.
     pub fn ip_host(&self) -> IpHost {
         self.inner.ip_host()
     }
 
+    /// Replaces the hostname, returning the old one; see [`IpHostResolver::replace_ip_host`].
+    ///
+    /// The new hostname is first resolved on the next refresh, up to `refresh_interval` later.
     pub fn replace_ip_host(&self, ip_host: IpHost) -> IpHost {
         self.inner.replace_ip_host(ip_host)
     }
 
+    /// The current DNS resolver.
     pub fn resolver(&self) -> Resolver {
         self.inner.resolver()
     }
 
+    /// Replaces the DNS resolver, returning the old one; see [`IpHostResolver::set_resolver`].
+    ///
+    /// The new resolver is first used on the next refresh, up to `refresh_interval` later.
     pub fn set_resolver(&self, resolver: Resolver) -> Resolver {
         self.inner.set_resolver(resolver)
     }

@@ -134,8 +134,16 @@ impl IpHostResolver {
     ///
     /// This method accepts options about what to do on error conditions.
     ///
-    /// - `use_cached_on_error`: whether to use cached results when a resolution error occurs.
-    /// - `retain_stale_values`: whether to keep the cached IPv4 / IPv6 address when a resolution returns no address of that family.
+    /// - `use_cached_on_error`: whether [`resolve`](Self::resolve) returns the cached addresses
+    ///   when the lookup fails, instead of nothing. Either way, a failed lookup leaves the cache
+    ///   as it was.
+    /// - `retain_stale_values`: whether to keep the cached IPv4 / IPv6 address when a successful
+    ///   lookup returns no address of that family, instead of clearing it.
+    ///
+    /// With the built-in resolvers (every [`Resolver`] but [`Resolver::System`]), a lookup whose
+    /// query for one address family fails while the other's succeeds counts as failed for
+    /// that family only: its cached address stays, and `use_cached_on_error` decides whether
+    /// it is returned.
     pub fn new_with_config(
         ip_host: IpHost,
         use_cached_on_error: bool,
@@ -184,11 +192,16 @@ impl IpHostResolver {
     }
 
     /// Returns the IPv4 address currently we have for this hostname without resolving it now.
+    ///
+    /// This is the previous address for as long as lookups still return it, otherwise the
+    /// first one returned, so it does not flap between the records of a name.
     pub fn ipv4_addr(&self) -> Option<Ipv4Addr> {
         self.state().v4_addr
     }
 
     /// Returns the IPv6 address currently we have for this hostname without resolving it now.
+    ///
+    /// Chosen as for [`ipv4_addr`](Self::ipv4_addr).
     pub fn ipv6_addr(&self) -> Option<Ipv6Addr> {
         self.state().v6_addr
     }
@@ -238,6 +251,14 @@ impl IpHostResolver {
     }
 
     /// Resolves the hostname, refreshes the stored values, and returns all resolved IP addresses.
+    ///
+    /// The addresses come in the resolver's order. For a family whose query failed, the cached
+    /// address (if any) follows, when `use_cached_on_error` is set; see
+    /// [`new_with_config`](Self::new_with_config). An IP address hostname is returned as is,
+    /// without a lookup.
+    ///
+    /// When the hostname or resolver is replaced during the lookup, its result is discarded,
+    /// and the cached addresses for the new configuration are returned instead.
     ///
     /// This WILL block the calling thread, for at most [`Resolver::max_lookup_time`] when that
     /// is `Some`. It is safe to call from `tokio::task::spawn_blocking()`.

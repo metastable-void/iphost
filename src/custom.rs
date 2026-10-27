@@ -71,6 +71,27 @@ pub enum BindDevice {
 }
 
 /// Configuration for [`Resolver::Static`](crate::Resolver::Static).
+///
+/// Lookups use a built-in stub client (RFC 1035) that sends recursive queries, so the
+/// nameservers must be recursive resolvers. For each lookup:
+///
+/// - A and AAAA are queried in parallel, on a fresh socket each, from a port the operating
+///   system chooses, with a random query ID. A reply only counts when it matches the ID and the
+///   question; other datagrams are ignored.
+/// - Queries go over UDP without EDNS, so answers over 512 bytes come truncated and are
+///   retried over TCP within the same timeout.
+/// - The name is always queried as given: no search domains, no hosts file, and no special
+///   case for `localhost`.
+/// - An NXDOMAIN answer is final, and no other nameserver is asked. Other failures (timeouts,
+///   SERVFAIL, REFUSED, malformed replies) move on to the next nameserver.
+/// - A name that exists but has neither A nor AAAA records is an error, as with
+///   `getaddrinfo`.
+/// - When the query of one family fails while the other's succeeds,
+///   [`IpHostResolver`](crate::IpHostResolver) keeps its address for the failed family as if
+///   the lookup had failed; an NXDOMAIN or empty answer for one family is not such a failure.
+///
+/// DNSSEC is not validated, and the path to the nameservers is trusted: a nameserver, or anyone
+/// who can read the queries on the way, can return any address.
 #[cfg_attr(docsrs, doc(cfg(feature = "custom")))]
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct StaticResolverConfig {
@@ -99,10 +120,12 @@ impl StaticResolverConfig {
         self
     }
 
+    /// The nameservers, in the order they are asked.
     pub fn nameservers(&self) -> &[SocketAddr] {
         &self.nameservers
     }
 
+    /// The device resolver sockets are bound to, if any.
     pub fn bind_device(&self) -> Option<&BindDevice> {
         self.bind_device.as_ref()
     }

@@ -34,9 +34,16 @@ pub struct Ipv6ResolverConfig {
 }
 
 impl Ipv6ResolverConfig {
-    /// Starts every enabled source on `interface` right away. Fails only when none of them can
-    /// start (e.g. without the privileges each needs; see the per-source configs), returning the
-    /// last error. An invalid `client_id` is always an error.
+    /// Starts every enabled source on `interface` right away. A source that cannot start is
+    /// left out, and not retried later.
+    ///
+    /// # Errors
+    ///
+    /// - `client_id` is invalid, as for
+    ///   [`Dhcpv6ResolverConfig::new`](crate::Dhcpv6ResolverConfig::new), even when only `ra`
+    ///   is enabled.
+    /// - None of the sources can start (e.g. without the privileges each needs; see the
+    ///   per-source configs). The error is the last source's: RA's when both are enabled.
     pub fn new(interface: impl Into<String>, client_id: ClientId) -> io::Result<Self> {
         let interface = interface.into();
         client_id.validate()?;
@@ -65,6 +72,7 @@ impl Ipv6ResolverConfig {
         }
     }
 
+    /// The interface the sources run on, and lookups are bound to.
     pub fn interface(&self) -> &str {
         &self.interface
     }

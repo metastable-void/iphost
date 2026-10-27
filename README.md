@@ -8,6 +8,19 @@ Stable hostname resolution library that supports storing a hostname in following
 
 FQDNs are resolved with the system resolver by default. The DNS resolver can be swapped at runtime.
 
+## Resolution behavior
+
+`IpHostResolver` keeps one IPv4 and one IPv6 address per hostname. It keeps the previous address for as long as lookups still return it, so the chosen address does not flap between the records of a name. `AutoIpHostResolver` resolves periodically on a background thread and, with the `broadcast` feature, reports when either address changes.
+
+Two options control error handling (`IpHostResolver::new_with_config`):
+
+- `use_cached_on_error` (default `true`): when a lookup fails, `resolve()` returns the cached addresses instead of nothing. A failed lookup never changes the cache.
+- `retain_stale_values` (default `false`): when a lookup succeeds but returns no address of a family, the cached address of that family is kept instead of cleared.
+
+With the built-in resolvers (`custom`, `ra`, `dhcpv6`), A and AAAA are queried separately. If one fails (a timeout, SERVFAIL, etc.) while the other succeeds, that family is treated as a failed lookup and its cached address stays. An NXDOMAIN or empty answer for one family is not a failure. With `Resolver::System`, the operating system decides how partial failures are reported.
+
+Replacing the hostname or the resolver resets the cache. A lookup still in flight for the old configuration is discarded.
+
 ## Features
 
 - `serde` (default): `Serialize` / `Deserialize` for `IpHost`.
@@ -17,6 +30,18 @@ FQDNs are resolved with the system resolver by default. The DNS resolver can be 
 - `ra` (implies `custom`): `Resolver::Ra` to use the DNS servers advertised by IPv6 routers (RDNSS) on an interface. Reads RAs on a raw ICMPv6 socket and sends Router Solicitations when privileged; falls back to the kernel's RA options via netlink when unprivileged on Linux.
 - `dhcpv6` (implies `custom`): `Resolver::Dhcpv6` to use the DNS servers from stateless DHCPv6 (Information-Request) on an interface. Needs to bind UDP port 546. The Client Identifier must be chosen explicitly, since some networks require a particular one.
 - With `ra` and/or `dhcpv6`: `Resolver::Ipv6` uses DHCPv6 or Router Advertisements on an interface, whichever is available, preferring DHCPv6. Only the enabled sources are used: with just `ra` it behaves like `Resolver::Ra` (and ignores the Client Identifier), with just `dhcpv6` like `Resolver::Dhcpv6`.
+
+## Built-in stub client
+
+The `custom`, `ra` and `dhcpv6` resolvers share a minimal stub client (RFC 1035):
+
+- Recursive queries only, so the nameservers must be recursive resolvers.
+- A and AAAA are queried in parallel. Each query uses a fresh socket, a port the OS picks and a random ID, and only accepts a reply that matches its ID and question.
+- UDP without EDNS. Truncated answers are retried over TCP.
+- Names are queried exactly as given. There are no search domains, no hosts file and no `localhost` special case.
+- Nameservers are asked in order, and the list is tried twice, with a 5 s timeout per query. NXDOMAIN is final, and other failures move on to the next nameserver. `Resolver::max_lookup_time` gives the upper bound. Discovered nameservers (RA, DHCPv6) are limited to the first three, after waiting up to 3 s for them to appear.
+- A name with neither A nor AAAA records is an error, as with `getaddrinfo`.
+- There is no DNSSEC validation. The nameservers, and the network path to them, are trusted.
 
 ## Network-specific notes
 

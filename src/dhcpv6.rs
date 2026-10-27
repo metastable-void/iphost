@@ -91,6 +91,14 @@ impl Dhcpv6ResolverConfig {
     /// systemd-networkd) receives the Replies instead, so this then gets no DNS servers.
     ///
     /// The interface does not need to exist yet.
+    ///
+    /// # Errors
+    ///
+    /// - `client_id` is a [`ClientId::Raw`] that is not 3 to 130 bytes long
+    ///   ([`io::ErrorKind::InvalidInput`]).
+    /// - No other config holds the socket on this interface and it cannot be opened, e.g.
+    ///   without the privileges for port 546, or when another process holds that port.
+    /// - A client thread cannot be spawned.
     pub fn new(interface: impl Into<String>, client_id: ClientId) -> io::Result<Self> {
         let interface = interface.into();
         client_id.validate()?;
@@ -123,6 +131,7 @@ impl Dhcpv6ResolverConfig {
         })
     }
 
+    /// The interface DHCPv6 runs on, and lookups are bound to.
     pub fn interface(&self) -> &str {
         &self.interface
     }

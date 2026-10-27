@@ -80,6 +80,14 @@ impl RaResolverConfig {
     /// Elsewhere, this fails without privileges.
     ///
     /// The interface does not need to exist yet.
+    ///
+    /// # Errors
+    ///
+    /// - The raw socket cannot be opened, and (on Linux, when that was for lack of privileges)
+    ///   neither can the netlink socket.
+    /// - Router Advertisements are not supported on this platform
+    ///   ([`io::ErrorKind::Unsupported`]).
+    /// - The listener thread cannot be spawned.
     pub fn new(interface: impl Into<String>) -> io::Result<Self> {
         let interface = interface.into();
         let shared = Arc::new(Shared::default());
@@ -91,6 +99,7 @@ impl RaResolverConfig {
         })
     }
 
+    /// The interface RAs are read on, and lookups are bound to.
     pub fn interface(&self) -> &str {
         &self.interface
     }
