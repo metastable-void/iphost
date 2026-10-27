@@ -281,10 +281,14 @@ mod sys {
         Ok(())
     }
 
-    /// RFC 3542 `ICMP6_FILTER` that passes only Router Advertisements (a set bit blocks a type).
+    /// RFC 3542 `ICMP6_FILTER` that passes only Router Advertisements. A set bit blocks a type,
+    /// except on illumos / Solaris, where their `ICMP6_FILTER_*` macros use the opposite polarity.
     pub(super) fn ra_only_filter() -> [u32; 8] {
         let mut filter = [u32::MAX; 8];
         filter[usize::from(ND_ROUTER_ADVERT / 32)] &= !(1 << (ND_ROUTER_ADVERT % 32));
+        if cfg!(any(target_os = "illumos", target_os = "solaris")) {
+            filter = filter.map(|word| !word);
+        }
         filter
     }
 
@@ -675,13 +679,18 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn filter_passes_only_ra() {
+        let blocked = if cfg!(any(target_os = "illumos", target_os = "solaris")) {
+            0
+        } else {
+            u32::MAX
+        };
         let filter = sys::ra_only_filter();
-        assert_eq!(filter[4], !(1 << 6)); // 134 = 4 * 32 + 6
+        assert_eq!(filter[4], blocked ^ (1 << 6)); // 134 = 4 * 32 + 6
         assert!(
             filter
                 .iter()
                 .enumerate()
-                .all(|(i, w)| i == 4 || *w == u32::MAX)
+                .all(|(i, w)| i == 4 || *w == blocked)
         );
     }
 
