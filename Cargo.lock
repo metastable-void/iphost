@@ -420,6 +420,7 @@ dependencies = [
  "socket2",
  "tokio",
  "tracing",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

@@ -126,6 +126,46 @@ fn ra_resolver() {
     );
 }
 
+/// The DHCPv6 server hands out the link-local DNS server fe80::2, and echoes our Client Identifier.
+#[cfg(feature = "dhcpv6")]
+fn dhcpv6_resolver(client_id: iphost::ClientId) {
+    let config = iphost::Dhcpv6ResolverConfig::new("ve0", client_id).unwrap();
+    let resolver = IpHostResolver::new_with_config("example.test".parse().unwrap(), false, false)
+        .with_resolver(Resolver::Dhcpv6(config.clone()));
+    assert_eq!(resolver.resolve(), vec![VIA_INTERFACE]);
+    assert_eq!(
+        config.nameservers(),
+        vec!["fe80::2".parse::<std::net::Ipv6Addr>().unwrap()]
+    );
+}
+
+#[cfg(feature = "dhcpv6")]
+#[test]
+#[ignore = "needs tests/linux-bind.sh"]
+fn dhcpv6_anonymous() {
+    dhcpv6_resolver(iphost::ClientId::None);
+}
+
+#[cfg(feature = "dhcpv6")]
+#[test]
+#[ignore = "needs tests/linux-bind.sh"]
+fn dhcpv6_duid_ll() {
+    let mac = std::fs::read_to_string("/sys/class/net/ve0/address").unwrap();
+    let mac: Vec<u8> = mac
+        .trim()
+        .split(':')
+        .map(|b| u8::from_str_radix(b, 16).unwrap())
+        .collect();
+    dhcpv6_resolver(iphost::ClientId::DuidLl(mac.try_into().unwrap()));
+}
+
+#[cfg(feature = "dhcpv6")]
+#[test]
+#[ignore = "needs tests/linux-bind.sh"]
+fn dhcpv6_random_duid_ll() {
+    dhcpv6_resolver(iphost::ClientId::RandomDuidLl);
+}
+
 /// The resolver can be swapped at runtime.
 #[test]
 #[ignore = "needs tests/linux-bind.sh"]

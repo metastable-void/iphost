@@ -25,6 +25,11 @@ pub enum Resolver {
     #[cfg(feature = "ra")]
     #[cfg_attr(docsrs, doc(cfg(feature = "ra")))]
     Ra(crate::RaResolverConfig),
+
+    /// DNS servers from stateless DHCPv6 (Information-Request).
+    #[cfg(feature = "dhcpv6")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "dhcpv6")))]
+    Dhcpv6(crate::Dhcpv6ResolverConfig),
 }
 
 impl Resolver {
@@ -39,6 +44,8 @@ impl Resolver {
             Resolver::Static(config) => config.lookup(fqdn),
             #[cfg(feature = "ra")]
             Resolver::Ra(config) => config.lookup(fqdn),
+            #[cfg(feature = "dhcpv6")]
+            Resolver::Dhcpv6(config) => config.lookup(fqdn),
         }
     }
 }

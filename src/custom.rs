@@ -175,7 +175,20 @@ pub(crate) fn if_index(name: &str) -> io::Result<u32> {
     }
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+pub(crate) fn if_index(name: &str) -> io::Result<u32> {
+    let name = std::ffi::CString::new(name)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "NUL in interface name"))?;
+    // SAFETY: `name` is a valid NUL-terminated string.
+    match unsafe {
+        windows_sys::Win32::NetworkManagement::IpHelper::if_nametoindex(name.as_ptr().cast())
+    } {
+        0 => Err(io::Error::new(io::ErrorKind::NotFound, "no such interface")),
+        index => Ok(index),
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
 pub(crate) fn if_index(_name: &str) -> io::Result<u32> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,

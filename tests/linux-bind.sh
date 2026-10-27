@@ -1,5 +1,5 @@
 #!/bin/sh
-# Runs tests/linux_bind.rs (interface / VRF binding, RA) in a privileged Docker container.
+# Runs tests/linux_bind.rs (interface / VRF binding, RA, DHCPv6) in a privileged Docker container.
 # Usage: tests/linux-bind.sh
 set -eu
 
@@ -56,6 +56,11 @@ if [ "${1:-}" = "--inside" ]; then
     dns peer ve1 192.0.2.7
     dns peer2 ve3 192.0.2.8
 
+    # Stateless DHCPv6 server on ve1, handing out the link-local DNS server.
+    at peer dnsmasq --port=0 --interface=ve1 --bind-interfaces --user=root \
+        --pid-file=/run/dnsmasq-dhcpv6.pid --dhcp-leasefile=/tmp/dhcpv6.leases \
+        --dhcp-range=2001:db8:99::,static '--dhcp-option=option6:dns-server,[fe80::2]'
+
     # Router on ve1 advertising RDNSS. `UnicastOnly on`: answers solicitations only.
     radvd_start() {
         cat >/tmp/radvd.conf <<EOF
@@ -87,7 +92,7 @@ fi
 
 cd "$(dirname "$0")/.."
 target=x86_64-unknown-linux-musl
-bin=$(cargo test --target "$target" --features ra --test linux_bind --no-run 2>&1 |
+bin=$(cargo test --target "$target" --features ra,dhcpv6 --test linux_bind --no-run 2>&1 |
     sed -n 's/.*Executable .*(\(.*\))$/\1/p')
 if [ -z "$bin" ]; then
     echo "linux-bind.sh: failed to build the test binary" >&2
