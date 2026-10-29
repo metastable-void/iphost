@@ -208,7 +208,16 @@ impl StaticResolverConfig {
         name: &[u8],
         qtype: u16,
     ) -> Result<Vec<IpAddr>, Failure> {
-        let deadline = Instant::now() + QUERY_TIMEOUT;
+        self.query_server_until(server, name, qtype, Instant::now() + QUERY_TIMEOUT)
+    }
+
+    fn query_server_until(
+        &self,
+        server: SocketAddr,
+        name: &[u8],
+        qtype: u16,
+        deadline: Instant,
+    ) -> Result<Vec<IpAddr>, Failure> {
         let target = with_scope(server, self.scope_id(server)?);
         let id = random_u32() as u16;
         let query = build_query(id, name, qtype);
@@ -216,6 +225,7 @@ impl StaticResolverConfig {
         let socket = self.socket(target, Type::DGRAM, Protocol::UDP)?;
         socket.connect(&target.into())?;
         let socket = UdpSocket::from(socket);
+        socket.set_write_timeout(Some(remaining(deadline)?))?;
         socket.send(&query)?;
         let mut buf = vec![0u8; usize::from(u16::MAX)];
         let len = loop {
@@ -248,10 +258,19 @@ impl StaticResolverConfig {
         let socket = self.socket(target, Type::STREAM, Protocol::TCP)?;
         socket.connect_timeout(&target.into(), remaining(deadline)?)?;
         let mut stream = TcpStream::from(socket);
-        stream.set_write_timeout(Some(remaining(deadline)?))?;
         let len = u16::try_from(query.len())
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "query too long"))?;
-        stream.write_all(&[&len.to_be_bytes()[..], query].concat())?;
+        let data = [&len.to_be_bytes()[..], query].concat();
+        let mut sent = 0;
+        while sent < data.len() {
+            stream.set_write_timeout(Some(remaining(deadline)?))?;
+            match stream.write(&data[sent..]) {
+                Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
+                Ok(n) => sent += n,
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                Err(e) => return Err(e),
+            }
+        }
         let mut len = [0u8; 2];
         read_full(&mut stream, &mut len, deadline)?;
         let mut response = vec![0u8; usize::from(u16::from_be_bytes(len))];
@@ -957,5 +976,96 @@ mod tests {
         assert_eq!(query_time_bound(2), Duration::from_secs(20));
         // Saturates instead of overflowing.
         assert!(query_time_bound(usize::MAX) > Duration::from_secs(20));
+    }
+
+    #[test]
+    fn unrelated_udp_traffic_does_not_restart_deadline() {
+        let server = UdpSocket::bind("127.0.0.1:0").unwrap();
+        server
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let addr = server.local_addr().unwrap();
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let done = stop.clone();
+        let worker = std::thread::spawn(move || {
+            let mut buf = [0; 512];
+            let (len, src) = server.recv_from(&mut buf).unwrap();
+            let mut reply = answer(&buf[..len], false, false, 0);
+            reply[0] ^= 1; // Unrelated ID; interleave malformed packets too.
+            let end = Instant::now() + Duration::from_secs(2);
+            while !done.load(Ordering::Relaxed) && Instant::now() < end {
+                let _ = server.send_to(&reply, src);
+                let _ = server.send_to(&[0], src);
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        });
+        let start = Instant::now();
+        let result = StaticResolverConfig::new([addr]).query_server_until(
+            addr,
+            EXAMPLE,
+            TYPE_A,
+            start + Duration::from_millis(100),
+        );
+        let elapsed = start.elapsed();
+        stop.store(true, Ordering::Relaxed);
+        worker.join().unwrap();
+        assert!(
+            matches!(result, Err(Failure::Other(e)) if matches!(e.kind(), io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock))
+        );
+        assert!(elapsed < Duration::from_secs(1), "{elapsed:?}");
+    }
+
+    #[test]
+    fn udp_and_trickling_tcp_share_one_deadline() {
+        let tcp = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = tcp.local_addr().unwrap();
+        let udp = UdpSocket::bind(addr).unwrap();
+        udp.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        tcp.set_nonblocking(true).unwrap();
+        let worker = std::thread::spawn(move || {
+            let mut buf = [0; 512];
+            let (len, src) = udp.recv_from(&mut buf).unwrap();
+            std::thread::sleep(Duration::from_millis(40));
+            udp.send_to(&answer(&buf[..len], false, false, 0), src)
+                .unwrap();
+            let end = Instant::now() + Duration::from_secs(2);
+            let mut stream = loop {
+                match tcp.accept() {
+                    Ok((stream, _)) => break stream,
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock && Instant::now() < end => {
+                        std::thread::sleep(Duration::from_millis(1))
+                    }
+                    Err(e) => panic!("TCP accept: {e}"),
+                }
+            };
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let mut len = [0; 2];
+            stream.read_exact(&mut len).unwrap();
+            let mut query = vec![0; u16::from_be_bytes(len) as usize];
+            stream.read_exact(&mut query).unwrap();
+            let reply = answer(&query, true, false, 0);
+            let framed = [&(reply.len() as u16).to_be_bytes()[..], &reply].concat();
+            for byte in framed {
+                if stream.write_all(&[byte]).is_err() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        });
+        let start = Instant::now();
+        let result = StaticResolverConfig::new([addr]).query_server_until(
+            addr,
+            BIG,
+            TYPE_A,
+            start + Duration::from_millis(140),
+        );
+        let elapsed = start.elapsed();
+        worker.join().unwrap();
+        assert!(
+            matches!(result, Err(Failure::Other(e)) if matches!(e.kind(), io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock))
+        );
+        assert!(elapsed < Duration::from_millis(500), "{elapsed:?}");
     }
 }

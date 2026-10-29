@@ -21,6 +21,8 @@ With the built-in resolvers (`custom`, `ra`, `dhcpv6`), A and AAAA are queried s
 
 Replacing the hostname or the resolver resets the cache. A lookup still in flight for the old configuration is discarded.
 
+`Resolver::System.max_lookup_time()` is `None`: libc controls its duration. Dropping the last `AutoIpHostResolver` clone signals shutdown without waiting, but its worker cannot exit until an ongoing lookup returns. Dropping interest, timing out a caller's wait, or replacing a hostname does not cancel libc execution.
+
 ## Features
 
 - `serde` (default): `Serialize` / `Deserialize` for `IpHost`.
@@ -30,6 +32,8 @@ Replacing the hostname or the resolver resets the cache. A lookup still in fligh
 - `ra` (implies `custom`): `Resolver::Ra` to use the DNS servers advertised by IPv6 routers (RDNSS) on an interface. Reads RAs on a raw ICMPv6 socket and sends Router Solicitations when privileged; falls back to the kernel's RA options via netlink when unprivileged on Linux.
 - `dhcpv6` (implies `custom`): `Resolver::Dhcpv6` to use the DNS servers from stateless DHCPv6 (Information-Request) on an interface. Needs to bind UDP port 546. The Client Identifier must be chosen explicitly, since some networks require a particular one.
 - With `ra` and/or `dhcpv6`: `Resolver::Ipv6` uses DHCPv6 or Router Advertisements on an interface, whichever is available, preferring DHCPv6. Only the enabled sources are used: with just `ra` it behaves like `Resolver::Ra` (and ignores the Client Identifier), with just `dhcpv6` like `Resolver::Dhcpv6`.
+
+`RaResolverConfig` maintains up to 64 distinct RDNSS addresses per listener/interface, including stale entries. An advertisement refreshes only the listed addresses; a zero lifetime withdraws only that address, including its stale copy. Refreshed addresses come first in advertised order, followed by omitted entries. At capacity, eviction removes only omitted entries: expired ones first, then the earliest finite expiry, then infinite lifetimes, with address byte order breaking ties. An advertisement with more addresses than the capacity keeps its first 64. When no live servers remain, the documented stale-server fallback still applies. Only the first three current servers are queried.
 
 ## Built-in stub client
 

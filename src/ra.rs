@@ -12,9 +12,8 @@ use fqdn::FQDN;
 use crate::custom::{DISCOVERY_TIMEOUT, lookup_on_interface};
 use crate::resolver::Lookup;
 
-/// Netlink delivers one message per RDNSS option; messages from the same router this close
-/// together are treated as one RA.
-const MERGE_WINDOW: Duration = Duration::from_secs(1);
+/// Includes expired entries kept for availability; distinct from the three queried servers.
+const REPOSITORY_CAPACITY: usize = 64;
 
 const ND_ROUTER_SOLICIT: u8 = 133;
 const ND_ROUTER_ADVERT: u8 = 134;
@@ -35,6 +34,12 @@ pub enum RaSource {
 /// Configuration for [`Resolver::Ra`](crate::Resolver::Ra): DNS servers advertised by routers on an interface.
 ///
 /// Clones share one listener, which stops when the last clone is dropped.
+///
+/// The repository holds at most 64 distinct server addresses, including stale entries.
+/// Updates refresh advertised addresses in order, ahead of omitted entries. At capacity,
+/// only omitted entries are evicted: expired ones first, then the earliest finite expiry,
+/// then infinite lifetimes; address byte order breaks ties. An advertisement with more
+/// addresses than the capacity keeps its first 64. A zero lifetime always withdraws.
 #[cfg_attr(docsrs, doc(cfg(feature = "ra")))]
 #[derive(Clone)]
 pub struct RaResolverConfig {
@@ -149,17 +154,13 @@ impl Shared {
 /// RDNSS options from one RA (or one netlink message).
 #[derive(Debug, PartialEq, Eq)]
 struct Update {
-    router: Ipv6Addr,
     /// Addresses with their lifetimes in seconds.
     servers: Vec<(Ipv6Addr, u32)>,
-    /// False when this may be only part of an RA (netlink).
-    complete: bool,
 }
 
 #[derive(Debug, Default)]
 struct State {
     servers: Vec<Server>,
-    last: Option<(Ipv6Addr, Instant)>,
 }
 
 #[derive(Debug)]
@@ -170,26 +171,37 @@ struct Server {
 }
 
 impl State {
-    /// A new RA overwrites the previous servers. Lifetime 0 withdraws a server.
+    /// RFC 8106 section 6.2: omitted addresses retain their own lifetimes.
     fn apply(&mut self, update: Update, now: Instant) {
-        let merge = !update.complete
-            && self.last.is_some_and(|(router, at)| {
-                router == update.router && now.duration_since(at) < MERGE_WINDOW
-            });
-        if !merge {
-            self.servers.clear();
-        }
+        let mut refreshed: Vec<Server> = Vec::new();
         for (addr, lifetime) in update.servers {
             self.servers.retain(|s| s.addr != addr);
+            refreshed.retain(|s| s.addr != addr);
             if lifetime != 0 {
-                self.servers.push(Server {
+                refreshed.push(Server {
                     addr,
                     expiry: (lifetime != u32::MAX)
                         .then(|| now + Duration::from_secs(lifetime.into())),
                 });
             }
         }
-        self.last = Some((update.router, now));
+        // Only omitted entries are evicted, so a sender cannot pin the repository with
+        // infinite lifetimes and starve later advertisements.
+        refreshed.truncate(REPOSITORY_CAPACITY);
+        let kept = refreshed.len();
+        refreshed.append(&mut self.servers);
+        self.servers = refreshed;
+        while self.servers.len() > REPOSITORY_CAPACITY {
+            let evict = self
+                .servers
+                .iter()
+                .enumerate()
+                .skip(kept)
+                .min_by_key(|(_, s)| (s.expiry.is_none(), s.expiry, s.addr.octets()))
+                .unwrap()
+                .0;
+            self.servers.remove(evict);
+        }
     }
 
     /// Unexpired servers, or the stale ones while no new values are available.
@@ -218,7 +230,10 @@ fn parse_rdnss(mut opts: &[u8]) -> Option<Vec<(Ipv6Addr, u32)>> {
         }
         let (opt, rest) = opts.split_at(len);
         // RFC 8106: length is 3 or more and odd (header + 16 bytes per address).
-        if opt[0] == ND_OPT_RDNSS && len >= 24 && (len / 8) % 2 == 1 {
+        if opt[0] == ND_OPT_RDNSS {
+            if len < 24 || (len / 8) % 2 != 1 {
+                return None;
+            }
             let lifetime = u32::from_be_bytes(opt[4..8].try_into().unwrap());
             let list: &mut Vec<_> = found.get_or_insert_default();
             for addr in opt[8..].as_chunks::<16>().0 {
@@ -241,9 +256,7 @@ fn parse_ra(packet: &[u8], src: Ipv6Addr, hop_limit: Option<i32>) -> Option<Upda
         return None;
     }
     Some(Update {
-        router: src,
         servers: parse_rdnss(&packet[16..])?,
-        complete: true,
     })
 }
 
@@ -577,11 +590,8 @@ mod sys {
                 attrs = &attrs[align4(len).min(attrs.len())..];
             }
 
-            Some(Update {
-                router: router?,
-                servers,
-                complete: false,
-            })
+            router?;
+            Some(Update { servers })
         }
     }
 
@@ -603,6 +613,19 @@ mod sys {
             "router advertisements are not supported on this platform",
         ))
     }
+}
+
+#[cfg(test)]
+pub(crate) fn test_config(servers: &[Ipv6Addr]) -> RaResolverConfig {
+    let config = RaResolverConfig {
+        interface: "test-interface".into(),
+        source: RaSource::Netlink,
+        shared: Arc::default(),
+    };
+    config.shared.apply(Update {
+        servers: servers.iter().map(|&a| (a, u32::MAX)).collect(),
+    });
+    config
 }
 
 #[cfg(test)]
@@ -645,11 +668,9 @@ mod tests {
         packet
     }
 
-    fn update(servers: &[(Ipv6Addr, u32)], complete: bool) -> Update {
+    fn update(servers: &[(Ipv6Addr, u32)]) -> Update {
         Update {
-            router: ROUTER,
             servers: servers.to_vec(),
-            complete,
         }
     }
 
@@ -669,7 +690,7 @@ mod tests {
         let packet = ra(&rdnss_opt(600, &[DNS1]));
         assert_eq!(
             parse_ra(&packet, ROUTER, Some(255)),
-            Some(update(&[(DNS1, 600)], true))
+            Some(update(&[(DNS1, 600)]))
         );
         assert_eq!(parse_ra(&packet, ROUTER, Some(64)), None);
         assert_eq!(parse_ra(&packet, ROUTER, None), None);
@@ -678,23 +699,121 @@ mod tests {
     }
 
     #[test]
-    fn new_ra_overwrites() {
+    fn withdrawal_preserves_omitted_server() {
         let now = Instant::now();
         let mut state = State::default();
-        state.apply(update(&[(DNS1, 600)], true), now);
-        state.apply(update(&[(DNS2, 600)], true), now);
+        state.apply(
+            parse_ra(&ra(&rdnss_opt(60, &[DNS1, DNS2])), ROUTER, Some(255)).unwrap(),
+            now,
+        );
+        state.apply(
+            parse_ra(&ra(&rdnss_opt(0, &[DNS1])), ROUTER, Some(255)).unwrap(),
+            now,
+        );
         assert_eq!(state.current(now), vec![DNS2]);
     }
 
     #[test]
-    fn netlink_parts_merge_within_window() {
+    fn refresh_preserves_expiry_and_stale_withdrawal_is_permanent() {
         let now = Instant::now();
         let mut state = State::default();
-        state.apply(update(&[(DNS1, 600)], false), now);
-        state.apply(update(&[(DNS2, 600)], false), now);
-        assert_eq!(state.current(now), vec![DNS1, DNS2]);
-        state.apply(update(&[(DNS2, 600)], false), now + MERGE_WINDOW);
-        assert_eq!(state.current(now), vec![DNS2]);
+        let mut apply = |opts: Vec<u8>, at| {
+            state.apply(parse_ra(&ra(&opts), ROUTER, Some(255)).unwrap(), at);
+        };
+        apply(rdnss_opt(60, &[DNS1, DNS2]), now);
+        apply(rdnss_opt(120, &[DNS1, DNS1]), now + Duration::from_secs(30));
+        assert_eq!(state.current(now + Duration::from_secs(60)), vec![DNS1]);
+        let stale = now + Duration::from_secs(160);
+        assert_eq!(state.current(stale), vec![DNS1, DNS2]);
+        state.apply(update(&[(DNS1, 0)]), stale);
+        assert_eq!(state.current(stale), vec![DNS2]);
+        state.apply(update(&[(DNS2, 60)]), stale);
+        assert_eq!(state.current(stale), vec![DNS2]);
+        assert_eq!(state.servers.len(), 1);
+        assert_eq!(
+            state.servers[0].expiry,
+            Some(stale + Duration::from_secs(60))
+        );
+        state.apply(update(&[(DNS2, 0)]), stale);
+        assert!(state.current(stale + Duration::from_secs(600)).is_empty());
+    }
+
+    #[test]
+    fn empty_and_malformed_ra_do_not_change_repository() {
+        let now = Instant::now();
+        let mut state = State::default();
+        state.apply(update(&[(DNS1, 60), (DNS2, 60)]), now);
+        let mut malformed = rdnss_opt(0, &[DNS1]);
+        malformed.extend([ND_OPT_RDNSS, 1, 0, 0, 0, 0, 0, 0]);
+        for opts in [vec![], vec![1, 1, 0, 0, 0, 0, 0, 0], malformed] {
+            if let Some(update) = parse_ra(&ra(&opts), ROUTER, Some(255)) {
+                state.apply(update, now);
+            }
+            assert_eq!(state.current(now), vec![DNS1, DNS2]);
+        }
+    }
+
+    #[test]
+    fn capacity_and_eviction_order() {
+        let now = Instant::now();
+        let mut state = State::default();
+        let servers: Vec<_> = (1..=REPOSITORY_CAPACITY as u128 + 10)
+            .map(|n| (Ipv6Addr::from(n), u32::MAX))
+            .collect();
+        state.apply(update(&servers), now);
+        assert_eq!(state.servers.len(), REPOSITORY_CAPACITY);
+        assert_eq!(
+            state.current(now),
+            servers[..REPOSITORY_CAPACITY]
+                .iter()
+                .map(|s| s.0)
+                .collect::<Vec<_>>()
+        );
+        state.apply(update(&[(servers[10].0, 0)]), now);
+        assert_eq!(state.servers.len(), REPOSITORY_CAPACITY - 1);
+
+        // Expired entries precede finite live entries, which precede infinite entries.
+        state.apply(update(&[(DNS1, 1)]), now);
+        state.apply(update(&[(DNS2, 60)]), now + Duration::from_secs(2));
+        assert!(!state.current(now).contains(&DNS1));
+        state.apply(update(&[(DNS1, u32::MAX)]), now + Duration::from_secs(2));
+        assert!(!state.current(now).contains(&DNS2));
+        assert_eq!(state.servers.len(), REPOSITORY_CAPACITY);
+
+        // A full repository of infinite entries cannot starve a new finite-lifetime address.
+        state.apply(update(&[(DNS2, 60)]), now + Duration::from_secs(2));
+        assert_eq!(state.servers.len(), REPOSITORY_CAPACITY);
+        assert_eq!(state.current(now + Duration::from_secs(2))[0], DNS2);
+    }
+
+    #[test]
+    fn clones_share_repository() {
+        let config = test_config(&[DNS1]);
+        let clone = config.clone();
+        assert_eq!(config, clone);
+        clone.shared.apply(update(&[(DNS2, u32::MAX)]));
+        assert_eq!(config.nameservers(), vec![DNS2, DNS1]);
+        assert_ne!(config, test_config(&[DNS1]));
+    }
+
+    #[test]
+    fn new_ra_preserves_omitted_servers() {
+        let now = Instant::now();
+        let mut state = State::default();
+        state.apply(update(&[(DNS1, 600)]), now);
+        state.apply(update(&[(DNS2, 600)]), now);
+        assert_eq!(state.current(now), vec![DNS2, DNS1]);
+    }
+
+    #[test]
+    fn delayed_updates_preserve_servers() {
+        let now = Instant::now();
+        let mut state = State::default();
+        state.apply(update(&[(DNS1, 600)]), now);
+        state.apply(update(&[(DNS2, 600)]), now);
+        assert_eq!(state.current(now), vec![DNS2, DNS1]);
+        state.apply(update(&[(DNS2, 600)]), now + Duration::from_secs(2));
+        assert_eq!(state.current(now), vec![DNS2, DNS1]);
     }
 
     #[test]
@@ -702,15 +821,16 @@ mod tests {
         let now = Instant::now();
         let later = now + Duration::from_secs(120);
         let mut state = State::default();
-        state.apply(update(&[(DNS1, 60), (DNS2, u32::MAX)], true), now);
+        state.apply(update(&[(DNS1, 60), (DNS2, u32::MAX)]), now);
         assert_eq!(state.current(later), vec![DNS2]);
 
         // Expired servers are still used while nothing newer is known.
-        state.apply(update(&[(DNS1, 60)], true), now);
+        state.apply(update(&[(DNS2, 0)]), now);
+        state.apply(update(&[(DNS1, 60)]), now);
         assert_eq!(state.current(later), vec![DNS1]);
 
         // Lifetime 0 withdraws.
-        state.apply(update(&[(DNS1, 0)], true), now);
+        state.apply(update(&[(DNS1, 0)]), now);
         assert!(state.current(now).is_empty());
     }
 
@@ -735,15 +855,21 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn parses_netlink_useropt() {
-        let opt = rdnss_opt(600, &[DNS1]);
+        let buf = netlink(&rdnss_opt(600, &[DNS1]), ROUTER);
+        assert_eq!(sys::parse_netlink(&buf, 7), vec![update(&[(DNS1, 600)])]);
+        assert!(sys::parse_netlink(&buf, 8).is_empty());
+    }
+
+    #[cfg(target_os = "linux")]
+    fn netlink(opt: &[u8], router: Ipv6Addr) -> Vec<u8> {
         let mut msg = vec![libc::AF_INET6 as u8, 0];
         msg.extend((opt.len() as u16).to_ne_bytes());
         msg.extend(7i32.to_ne_bytes());
         msg.extend([ND_ROUTER_ADVERT, 0, 0, 0, 0, 0, 0, 0]);
-        msg.extend(&opt);
+        msg.extend(opt);
         msg.extend(20u16.to_ne_bytes());
         msg.extend(1u16.to_ne_bytes());
-        msg.extend(ROUTER.octets());
+        msg.extend(router.octets());
 
         let mut buf = Vec::new();
         buf.extend((16 + msg.len() as u32).to_ne_bytes());
@@ -751,10 +877,42 @@ mod tests {
         buf.extend([0u8; 10]);
         buf.extend(&msg);
 
-        assert_eq!(
-            sys::parse_netlink(&buf, 7),
-            vec![update(&[(DNS1, 600)], false)]
+        buf
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn delayed_netlink_options_and_interleaved_routers_match_raw_lifetimes() {
+        let now = Instant::now();
+        let other = "fe80::2".parse().unwrap();
+        let options = [rdnss_opt(60, &[DNS1]), rdnss_opt(u32::MAX, &[DNS2])];
+        let mut raw = State::default();
+        raw.apply(
+            parse_ra(&ra(&options.concat()), ROUTER, Some(255)).unwrap(),
+            now,
         );
-        assert!(sys::parse_netlink(&buf, 8).is_empty());
+        let mut kernel = State::default();
+        for (i, opt) in options.iter().enumerate() {
+            let at = now + Duration::from_secs(i as u64 * 5);
+            // The second router refreshes the first address between delayed kernel messages.
+            if i == 1 {
+                let refresh = rdnss_opt(60, &[DNS1]);
+                raw.apply(parse_ra(&ra(&refresh), other, Some(255)).unwrap(), at);
+                for update in sys::parse_netlink(&netlink(&refresh, other), 7) {
+                    kernel.apply(update, at);
+                }
+            }
+            for update in sys::parse_netlink(&netlink(opt, ROUTER), 7) {
+                kernel.apply(update, at);
+            }
+        }
+        let entries = |state: &State| {
+            let mut entries: Vec<_> = state.servers.iter().map(|s| (s.addr, s.expiry)).collect();
+            entries.sort();
+            entries
+        };
+        assert_eq!(entries(&raw), entries(&kernel));
+        assert_eq!(raw.current(now + Duration::from_secs(65)), vec![DNS2]);
+        assert_eq!(kernel.current(now + Duration::from_secs(65)), vec![DNS2]);
     }
 }

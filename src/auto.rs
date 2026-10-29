@@ -43,7 +43,10 @@ impl IpChanges {
 /// Spawn a background thread to do hostname resolutions automatically.
 ///
 /// You can check the resolved values later after you started this.
-/// The thread exits when the last clone of this is dropped.
+/// Dropping the last clone signals the thread to exit after its current lookup returns.
+/// Drop does not wait for that thread. A system lookup inside libc has no bounded duration
+/// and cannot be cancelled by dropping this resolver, timing out a caller's wait, or replacing
+/// the hostname. Obsolete results cannot update the new hostname's cache.
 #[derive(Debug, Clone)]
 pub struct AutoIpHostResolver {
     inner: IpHostResolver,
@@ -101,7 +104,8 @@ impl AutoIpHostResolver {
 
     /// Replaces the hostname, returning the old one; see [`IpHostResolver::replace_ip_host`].
     ///
-    /// The new hostname is first resolved on the next refresh, up to `refresh_interval` later.
+    /// The new hostname is first resolved on the next refresh, after any current lookup
+    /// finishes and `refresh_interval` elapses.
     pub fn replace_ip_host(&self, ip_host: IpHost) -> IpHost {
         self.inner.replace_ip_host(ip_host)
     }
@@ -113,7 +117,8 @@ impl AutoIpHostResolver {
 
     /// Replaces the DNS resolver, returning the old one; see [`IpHostResolver::set_resolver`].
     ///
-    /// The new resolver is first used on the next refresh, up to `refresh_interval` later.
+    /// The new resolver is first used on the next refresh, after any current lookup
+    /// finishes and `refresh_interval` elapses.
     pub fn set_resolver(&self, resolver: Resolver) -> Resolver {
         self.inner.set_resolver(resolver)
     }
