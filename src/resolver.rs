@@ -49,12 +49,15 @@ impl Resolver {
     /// and queries both address families in parallel. The discovering resolvers (`Ra`,
     /// `Dhcpv6`, `Ipv6`) first wait a bounded time for their nameservers, of which at most
     /// three are used. `None` for [`Resolver::System`], whose timeouts are the operating
-    /// system's.
+    /// system's. `Ipv6` with failure fallback uses up to three servers per source: its bound
+    /// is 63 seconds with both sources started, otherwise 33 seconds, as for selection-only.
     pub fn max_lookup_time(&self) -> Option<Duration> {
         match self {
             Resolver::System => None,
             #[cfg(feature = "custom")]
             Resolver::Static(config) => Some(custom::query_time_bound(config.nameservers().len())),
+            #[cfg(any(feature = "ra", feature = "dhcpv6"))]
+            Resolver::Ipv6(config) => Some(config.max_lookup_time()),
             #[cfg(any(feature = "ra", feature = "dhcpv6"))]
             _ => Some(custom::DISCOVERY_TIMEOUT + custom::query_time_bound(custom::MAX_SERVERS)),
         }
@@ -263,6 +266,13 @@ impl IpHostResolver {
     /// This WILL block the calling thread, for at most [`Resolver::max_lookup_time`] when that
     /// is `Some`. It is safe to call from `tokio::task::spawn_blocking()`.
     pub fn resolve(&self) -> Vec<IpAddr> {
+        self.resolve_with(Resolver::lookup)
+    }
+
+    pub(crate) fn resolve_with(
+        &self,
+        lookup: impl FnOnce(&Resolver, &FQDN) -> io::Result<Lookup>,
+    ) -> Vec<IpAddr> {
         let (fqdn, resolver, generation) = {
             let state = self.state();
             match &state.ip_host {
@@ -273,7 +283,7 @@ impl IpHostResolver {
         };
 
         // No lock held here: lookups may take a long time.
-        let res = resolver.lookup(&fqdn);
+        let res = lookup(&resolver, &fqdn);
 
         let mut state = self.state();
         if state.generation != generation {

@@ -35,6 +35,8 @@ Replacing the hostname or the resolver resets the cache. A lookup still in fligh
 
 `RaResolverConfig` maintains up to 64 distinct RDNSS addresses per listener/interface, including stale entries. An advertisement refreshes only the listed addresses; a zero lifetime withdraws only that address, including its stale copy. Refreshed addresses come first in advertised order, followed by omitted entries. At capacity, eviction removes only omitted entries: expired ones first, then the earliest finite expiry, then infinite lifetimes, with address byte order breaking ties. An advertisement with more addresses than the capacity keeps its first 64. When no live servers remain, the documented stale-server fallback still applies. Only the first three current servers are queried.
 
+`Ipv6ResolverConfig::with_failure_fallback(true)` opts into trying RA servers when DHCPv6 DNS fails. The default still selects only DHCPv6's nonempty list, or RA if DHCPv6 has none. With fallback enabled, A and AAAA independently exhaust the DHCPv6 list before trying RA; positive answers, NXDOMAIN, and NOERROR/NODATA settle that family. Each lookup starts with DHCPv6 again. `nameservers()` still returns the preferred list; the source accessors expose each source's list. Discovery waits up to three seconds once, and snapshots up to three servers per source. The lookup bound is 63 seconds when both sources started and fallback is enabled, otherwise 33 seconds. Cache options, binding, link-local scope and VRF/routing-domain support are unchanged.
+
 ## Built-in stub client
 
 The `custom`, `ra` and `dhcpv6` resolvers share a minimal stub client (RFC 1035):

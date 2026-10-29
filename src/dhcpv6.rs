@@ -168,6 +168,18 @@ struct Shared {
     cond: Condvar,
 }
 
+#[cfg(test)]
+pub(crate) fn test_config(servers: &[Ipv6Addr]) -> Dhcpv6ResolverConfig {
+    Dhcpv6ResolverConfig {
+        interface: "test-interface".into(),
+        client_id: ClientId::None,
+        shared: Arc::new(Shared {
+            servers: Mutex::new(Some(servers.to_vec())),
+            cond: Condvar::new(),
+        }),
+    }
+}
+
 impl Shared {
     fn servers(&self) -> MutexGuard<'_, Option<Vec<Ipv6Addr>>> {
         self.servers.lock().unwrap_or_else(PoisonError::into_inner)

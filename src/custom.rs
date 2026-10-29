@@ -138,67 +138,7 @@ impl StaticResolverConfig {
                 "no nameservers configured",
             ));
         }
-        // Already in wire format: length-prefixed labels ending in the root label.
-        let name = fqdn.as_bytes();
-        let (v6, v4) = std::thread::scope(|scope| {
-            let v4 = std::thread::Builder::new()
-                .name("iphost-dns".into())
-                .spawn_scoped(scope, || self.query(name, TYPE_A));
-            let v6 = self.query(name, TYPE_AAAA);
-            let v4 = v4.and_then(|thread| {
-                thread
-                    .join()
-                    .unwrap_or_else(|_| Err(io::Error::other("A query panicked")))
-            });
-            (v6, v4)
-        });
-        // NXDOMAIN settles its family; any other error leaves the family unknown.
-        let failed = |r: &io::Result<Vec<IpAddr>>| {
-            r.as_ref()
-                .is_err_and(|e| e.kind() != io::ErrorKind::NotFound)
-        };
-        let (v4_failed, v6_failed) = (failed(&v4), failed(&v6));
-        let addrs: Vec<IpAddr> = match (v6, v4) {
-            (Err(e), Err(_)) => return Err(e),
-            (v6, v4) => v6
-                .into_iter()
-                .flatten()
-                .chain(v4.into_iter().flatten())
-                .collect(),
-        };
-        if addrs.is_empty() && !v4_failed && !v6_failed {
-            // As with `getaddrinfo`, a name without address records is an error.
-            return Err(io::Error::new(
-                io::ErrorKind::NotFound,
-                "no address records",
-            ));
-        }
-        Ok(Lookup {
-            addrs,
-            v4_failed,
-            v6_failed,
-        })
-    }
-
-    /// `qtype` records from the first nameserver that answers, trying the list [`ATTEMPTS`] times.
-    fn query(&self, name: &[u8], qtype: u16) -> io::Result<Vec<IpAddr>> {
-        let mut last = io::Error::new(io::ErrorKind::TimedOut, "no nameserver answered");
-        for _ in 0..ATTEMPTS {
-            for &server in &self.nameservers {
-                match self.query_server(server, name, qtype) {
-                    Ok(addrs) => return Ok(addrs),
-                    Err(Failure::NoSuchName) => {
-                        return Err(io::Error::new(io::ErrorKind::NotFound, "no such name"));
-                    }
-                    Err(Failure::Other(e)) => {
-                        #[cfg(feature = "tracing")]
-                        tracing::debug!(%server, error = %e, "DNS query failed");
-                        last = e;
-                    }
-                }
-            }
-        }
-        Err(last)
+        lookup_sources(std::slice::from_ref(self), fqdn)
     }
 
     /// One query to `server` within [`QUERY_TIMEOUT`]: UDP, then TCP if the answer was truncated.
@@ -312,6 +252,88 @@ impl StaticResolverConfig {
             _ => Ok(0),
         }
     }
+}
+
+/// Each family exhausts one source before advancing to the next; answers settle only that family.
+pub(crate) fn lookup_sources(configs: &[StaticResolverConfig], fqdn: &FQDN) -> io::Result<Lookup> {
+    lookup_families(|qtype| {
+        query_sources(configs, qtype, |config, server, qtype| {
+            config.query_server(server, fqdn.as_bytes(), qtype)
+        })
+    })
+}
+
+fn lookup_families(query: impl Fn(u16) -> io::Result<Vec<IpAddr>> + Sync) -> io::Result<Lookup> {
+    let (v6, v4) = std::thread::scope(|scope| {
+        let v4 = std::thread::Builder::new()
+            .name("iphost-dns".into())
+            .spawn_scoped(scope, || query(TYPE_A));
+        let v6 = query(TYPE_AAAA);
+        let v4 = v4.and_then(|thread| {
+            thread
+                .join()
+                .unwrap_or_else(|_| Err(io::Error::other("A query panicked")))
+        });
+        (v6, v4)
+    });
+    // NXDOMAIN settles its family; any other error leaves the family unknown.
+    let failed = |r: &io::Result<Vec<IpAddr>>| {
+        r.as_ref()
+            .is_err_and(|e| e.kind() != io::ErrorKind::NotFound)
+    };
+    let (v4_failed, v6_failed) = (failed(&v4), failed(&v6));
+    let addrs: Vec<IpAddr> = match (v6, v4) {
+        (Err(e), Err(_)) => return Err(e),
+        (v6, v4) => v6
+            .into_iter()
+            .flatten()
+            .chain(v4.into_iter().flatten())
+            .collect(),
+    };
+    if addrs.is_empty() && !v4_failed && !v6_failed {
+        // As with `getaddrinfo`, a name without address records is an error.
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "no address records",
+        ));
+    }
+    Ok(Lookup {
+        addrs,
+        v4_failed,
+        v6_failed,
+    })
+}
+
+/// The transport is injected so retry and source policy can be tested without network timing.
+fn query_sources(
+    configs: &[StaticResolverConfig],
+    qtype: u16,
+    mut query: impl FnMut(&StaticResolverConfig, SocketAddr, u16) -> Result<Vec<IpAddr>, Failure>,
+) -> io::Result<Vec<IpAddr>> {
+    let mut last = io::Error::new(io::ErrorKind::TimedOut, "no nameserver answered");
+    for config in configs {
+        for _ in 0..ATTEMPTS {
+            for &server in &config.nameservers {
+                match query(config, server, qtype) {
+                    Ok(addrs) => return Ok(addrs),
+                    Err(Failure::NoSuchName) => {
+                        return Err(io::Error::new(io::ErrorKind::NotFound, "no such name"));
+                    }
+                    Err(Failure::Other(e)) => {
+                        #[cfg(feature = "tracing")]
+                        tracing::debug!(%server, error = %e, "DNS query failed");
+                        last = e;
+                    }
+                }
+            }
+        }
+    }
+    // Reserve NotFound for DNS negatives; e.g. Windows uses it for a missing interface too.
+    Err(if last.kind() == io::ErrorKind::NotFound {
+        io::Error::other(last)
+    } else {
+        last
+    })
 }
 
 /// Why a nameserver gave no usable answer.
@@ -456,7 +478,7 @@ fn parse_response(msg: &[u8], id: u16, name: &[u8], qtype: u16) -> Result<Vec<Ip
 /// link-local servers. `source` names where the servers came from, for the error message.
 #[cfg(any(feature = "ra", feature = "dhcpv6"))]
 pub(crate) fn lookup_on_interface(
-    mut servers: Vec<Ipv6Addr>,
+    servers: Vec<Ipv6Addr>,
     interface: &str,
     fqdn: &FQDN,
     source: &str,
@@ -467,11 +489,18 @@ pub(crate) fn lookup_on_interface(
             format!("no DNS servers from {source}"),
         ));
     }
-    // Keeps the lookup time bounded (see `Resolver::max_lookup_time`).
-    servers.truncate(MAX_SERVERS);
-    StaticResolverConfig::new(servers.into_iter().map(|a| SocketAddr::new(a.into(), 53)))
-        .with_bind_device(BindDevice::Interface(interface.into()))
-        .lookup(fqdn)
+    discovered_config(servers, interface).lookup(fqdn)
+}
+
+#[cfg(any(feature = "ra", feature = "dhcpv6"))]
+pub(crate) fn discovered_config(servers: Vec<Ipv6Addr>, interface: &str) -> StaticResolverConfig {
+    StaticResolverConfig::new(
+        servers
+            .into_iter()
+            .take(MAX_SERVERS)
+            .map(|a| SocketAddr::new(a.into(), 53)),
+    )
+    .with_bind_device(BindDevice::Interface(interface.into()))
 }
 
 /// `setsockopt(2)` for options socket2 lacks.
@@ -976,6 +1005,265 @@ mod tests {
         assert_eq!(query_time_bound(2), Duration::from_secs(20));
         // Saturates instead of overflowing.
         assert!(query_time_bound(usize::MAX) > Duration::from_secs(20));
+    }
+
+    fn sources() -> [StaticResolverConfig; 2] {
+        [
+            StaticResolverConfig::new(["[::1]:1001".parse().unwrap()]),
+            StaticResolverConfig::new(["[::1]:2001".parse().unwrap()]),
+        ]
+    }
+
+    #[test]
+    fn source_fallback_is_per_family_and_retries_primary_next_time() {
+        let sources = sources();
+        let calls = std::sync::Mutex::new(Vec::new());
+        for recovered in [false, true] {
+            calls.lock().unwrap().clear();
+            let result = lookup_families(|qtype| {
+                query_sources(&sources, qtype, |_, server, ty| {
+                    calls.lock().unwrap().push((server.port(), ty));
+                    if server.port() == 1001 && ty == TYPE_AAAA && !recovered {
+                        return Err(io::Error::from(io::ErrorKind::TimedOut).into());
+                    }
+                    Ok(vec![if ty == TYPE_A { ADDR.into() } else { V6.into() }])
+                })
+            })
+            .unwrap();
+            assert_eq!(result.addrs, [IpAddr::V6(V6), IpAddr::V4(ADDR)]);
+            assert!(!result.v4_failed && !result.v6_failed);
+            let calls = calls.lock().unwrap();
+            assert_eq!(calls.iter().filter(|(_, ty)| *ty == TYPE_A).count(), 1);
+            let v6: Vec<_> = calls
+                .iter()
+                .filter(|(_, ty)| *ty == TYPE_AAAA)
+                .map(|(p, _)| *p)
+                .collect();
+            assert_eq!(
+                v6,
+                if recovered {
+                    vec![1001]
+                } else {
+                    vec![1001, 1001, 2001]
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn definitive_answers_never_consult_second_source() {
+        for answer in [0, 1, 2] {
+            let mut calls = 0;
+            let result = query_sources(&sources(), TYPE_A, |_, server, _| {
+                assert_eq!(server.port(), 1001);
+                calls += 1;
+                match answer {
+                    0 => Ok(vec![ADDR.into()]),
+                    1 => Ok(vec![]),
+                    _ => Err(Failure::NoSuchName),
+                }
+            });
+            assert_eq!(calls, 1);
+            if answer == 2 {
+                assert_eq!(result.unwrap_err().kind(), io::ErrorKind::NotFound);
+            } else {
+                assert!(result.is_ok());
+            }
+        }
+    }
+
+    #[test]
+    fn source_failures_exhaust_retries_before_fallback() {
+        for kind in [
+            io::ErrorKind::TimedOut,
+            io::ErrorKind::ConnectionRefused,
+            io::ErrorKind::InvalidData,
+            io::ErrorKind::Other,
+            io::ErrorKind::NotFound,
+        ] {
+            let mut calls = Vec::new();
+            let result = query_sources(&sources(), TYPE_A, |_, server, _| {
+                calls.push(server.port());
+                if server.port() == 1001 {
+                    Err(io::Error::from(kind).into())
+                } else {
+                    Ok(vec![ADDR.into()])
+                }
+            })
+            .unwrap();
+            assert_eq!(result, vec![IpAddr::V4(ADDR)]);
+            assert_eq!(calls, vec![1001, 1001, 2001]);
+        }
+        let mut sources = sources();
+        sources[0] = StaticResolverConfig::new([]);
+        let result = query_sources(&sources, TYPE_A, |_, server, _| {
+            assert_eq!(server.port(), 2001);
+            Ok(vec![ADDR.into()])
+        })
+        .unwrap();
+        assert_eq!(result, vec![IpAddr::V4(ADDR)]);
+    }
+
+    #[test]
+    fn virtual_time_bounds_for_two_sources_and_partial_families() {
+        let sources: Vec<_> = [1000, 2000]
+            .map(|base| {
+                StaticResolverConfig::new(
+                    (1..=3).map(|i| SocketAddr::from(([127, 0, 0, 1], base + i))),
+                )
+            })
+            .into();
+        for count in [1, 2] {
+            for partial in [false, true] {
+                let times = std::sync::Mutex::new(Vec::new());
+                let result = lookup_families(|qtype| {
+                    let mut elapsed = Duration::from_secs(3); // One discovery wait, shared by both families.
+                    let result = query_sources(&sources[..count], qtype, |_, _, _| {
+                        if partial && qtype == TYPE_A {
+                            return Ok(vec![ADDR.into()]);
+                        }
+                        elapsed += QUERY_TIMEOUT;
+                        Err(io::Error::from(io::ErrorKind::TimedOut).into())
+                    });
+                    times.lock().unwrap().push(elapsed);
+                    result
+                });
+                if partial {
+                    let result = result.unwrap();
+                    assert_eq!(result.addrs, vec![IpAddr::V4(ADDR)]);
+                    assert!(result.v6_failed && !result.v4_failed);
+                } else {
+                    assert!(result.is_err());
+                }
+                assert_eq!(
+                    *times.lock().unwrap().iter().max().unwrap(),
+                    Duration::from_secs(if count == 1 { 33 } else { 63 })
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn fallback_outcomes_preserve_cache_options_and_stable_selection() {
+        for use_cached in [false, true] {
+            for retain in [false, true] {
+                let resolver = IpHostResolver::new_with_config(
+                    "dual.test".parse().unwrap(),
+                    use_cached,
+                    retain,
+                );
+                let run = |mode| {
+                    resolver.resolve_with(|_, _| {
+                        lookup_families(|qtype| {
+                            query_sources(&sources(), qtype, |_, server, _| {
+                                if server.port() == 1001
+                                    || mode == 1
+                                    || (mode == 2 && qtype == TYPE_AAAA)
+                                {
+                                    return Err(io::Error::from(io::ErrorKind::TimedOut).into());
+                                }
+                                if mode == 3 && qtype == TYPE_AAAA {
+                                    return Ok(vec![]);
+                                }
+                                Ok(if qtype == TYPE_A {
+                                    if mode == 4 {
+                                        vec![Ipv4Addr::LOCALHOST.into(), ADDR.into()]
+                                    } else {
+                                        vec![ADDR.into()]
+                                    }
+                                } else {
+                                    vec![V6.into()]
+                                })
+                            })
+                        })
+                    })
+                };
+                assert_eq!(run(0), vec![IpAddr::V6(V6), IpAddr::V4(ADDR)]);
+                assert_eq!(
+                    run(1),
+                    if use_cached {
+                        vec![IpAddr::V6(V6), IpAddr::V4(ADDR)]
+                    } else {
+                        vec![]
+                    }
+                );
+                assert_eq!(resolver.ipv4_addr(), Some(ADDR));
+                assert_eq!(resolver.ipv6_addr(), Some(V6));
+                assert_eq!(
+                    run(2),
+                    if use_cached {
+                        vec![IpAddr::V4(ADDR), IpAddr::V6(V6)]
+                    } else {
+                        vec![IpAddr::V4(ADDR)]
+                    }
+                );
+                assert_eq!(run(3), vec![IpAddr::V4(ADDR)]);
+                assert_eq!(resolver.ipv6_addr(), if retain { Some(V6) } else { None });
+                run(4);
+                assert_eq!(resolver.ipv4_addr(), Some(ADDR));
+            }
+        }
+    }
+
+    #[test]
+    fn fallback_result_for_obsolete_configuration_is_discarded() {
+        let resolver = IpHostResolver::new("dual.test".parse().unwrap());
+        let result = resolver.resolve_with(|_, _| {
+            resolver.replace_ip_host(crate::IpHost::V4Addr(Ipv4Addr::LOCALHOST));
+            lookup_families(|qtype| {
+                query_sources(&sources(), qtype, |_, server, _| {
+                    if server.port() == 1001 {
+                        Err(io::Error::from(io::ErrorKind::TimedOut).into())
+                    } else {
+                        Ok(vec![if qtype == TYPE_A {
+                            ADDR.into()
+                        } else {
+                            V6.into()
+                        }])
+                    }
+                })
+            })
+        });
+        assert_eq!(result, vec![IpAddr::V4(Ipv4Addr::LOCALHOST)]);
+        assert_eq!(resolver.ipv6_addr(), None);
+    }
+
+    #[test]
+    fn missing_interface_is_a_failure_not_a_dns_negative() {
+        let resolver = IpHostResolver::new("dual.test".parse().unwrap());
+        resolver.resolve_with(|_, _| {
+            lookup_families(|qtype| {
+                Ok(vec![if qtype == TYPE_A {
+                    ADDR.into()
+                } else {
+                    V6.into()
+                }])
+            })
+        });
+        let result = resolver.resolve_with(|_, _| {
+            lookup_families(|qtype| {
+                query_sources(&sources(), qtype, |_, _, _| {
+                    if qtype == TYPE_A {
+                        // Windows if_nametoindex reports a missing interface this way.
+                        Err(io::Error::new(io::ErrorKind::NotFound, "no such interface").into())
+                    } else {
+                        Ok(vec![V6.into()])
+                    }
+                })
+            })
+        });
+        assert_eq!(result, vec![IpAddr::V6(V6), IpAddr::V4(ADDR)]);
+        assert_eq!(resolver.ipv4_addr(), Some(ADDR));
+    }
+
+    #[test]
+    fn fallback_uses_real_udp_and_tcp_transport() {
+        let sources = [
+            StaticResolverConfig::new([fake_server(true)]),
+            StaticResolverConfig::new([fake_server(false)]),
+        ];
+        let result = lookup_sources(&sources, &"big.test".parse().unwrap()).unwrap();
+        assert_eq!(result.addrs.len(), 3);
     }
 
     #[test]
