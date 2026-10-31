@@ -1,6 +1,19 @@
 # Changelog
 
-## 0.4.1 (unreleased)
+## 0.4.2 (2026-10-31)
+
+- Scope shared DHCPv6 listeners to their network namespace on Linux and
+  Android. Configurations on equally named interfaces in different
+  namespaces previously reused the first namespace's socket. Sharing
+  within one namespace is preserved. Namespace cookies avoid procfs and
+  extra privileges; kernels without that option use the namespace inode
+  from `/proc/thread-self/ns/net`. Public APIs and DNS policies are unchanged.
+- Add a live regression that keeps both namespaces' listeners alive and
+  checks independent sockets, alongside sharing within each namespace.
+- Release dead listeners' cache records and storage. Repeated construction
+  failures also release the cache lock and socket before returning an error.
+
+## 0.4.1 (2026-10-29)
 
 ### Protocol and deadline fixes
 

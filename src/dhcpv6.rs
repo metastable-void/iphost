@@ -1,5 +1,6 @@
 //! DNS servers from stateless DHCPv6 (`dhcpv6` feature): Information-Request, RFC 8415 section 18.2.6.
 
+use std::collections::BTreeMap;
 use std::io;
 use std::net::{Ipv6Addr, SocketAddr, SocketAddrV6, UdpSocket};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError, Weak, mpsc};
@@ -82,10 +83,13 @@ impl Dhcpv6ResolverConfig {
     /// `client_id` is required on purpose, because some networks only answer a particular one
     /// (e.g. NTT's NGN needs [`ClientId::DuidLl`] with the interface's MAC address); see [`ClientId`].
     ///
-    /// All configs on the same interface share one socket on UDP port 546, tied to that
+    /// All configs on the same interface in the same network namespace share one socket
+    /// on UDP port 546, tied to that
     /// interface; any number of configs can use the same interface. Binding port 546 needs
     /// privileges on most platforms (e.g. `CAP_NET_BIND_SERVICE` on Linux). The socket is
     /// closed when the last config on the interface is dropped.
+    /// On Linux and Android, namespace identity uses `SO_NETNS_COOKIE`; older
+    /// kernels without that option need readable `/proc/thread-self/ns/net`.
     ///
     /// Another DHCPv6 client on the host that is bound to the interface's address (e.g.
     /// systemd-networkd) receives the Replies instead, so this then gets no DNS servers.
@@ -99,6 +103,8 @@ impl Dhcpv6ResolverConfig {
     /// - No other config holds the socket on this interface and it cannot be opened, e.g.
     ///   without the privileges for port 546, or when another process holds that port.
     /// - A client thread cannot be spawned.
+    /// - On Linux or Android, the namespace cannot be identified: a kernel
+    ///   without `SO_NETNS_COOKIE` also has no readable `/proc/thread-self/ns/net`.
     pub fn new(interface: impl Into<String>, client_id: ClientId) -> io::Result<Self> {
         let interface = interface.into();
         client_id.validate()?;
@@ -224,14 +230,66 @@ fn arrived_on(src: SocketAddr, index: Option<u32>) -> bool {
 /// when no socket is bound to the destination address, so it never takes Replies away from
 /// another client bound to the link-local address (e.g. systemd-networkd).
 struct Listener {
+    namespace: Namespace,
     interface: String,
     /// The socket, and the interface index it is tied to (`None` while the interface is absent).
     socket: Mutex<(Arc<UdpSocket>, Option<u32>)>,
     clients: Mutex<Vec<mpsc::Sender<Datagram>>>,
 }
 
-/// Per interface, held strongly only by clients (and briefly by the receive thread).
-static LISTENERS: Mutex<Vec<(String, Weak<Listener>)>> = Mutex::new(Vec::new());
+/// Distinguishes equally named interfaces in separate network namespaces.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Namespace {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    Cookie(u64),
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    Inode(u64, u64),
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    Native,
+}
+
+type Interfaces = BTreeMap<String, Weak<Listener>>;
+static LISTENERS: Mutex<BTreeMap<Namespace, Interfaces>> = Mutex::new(BTreeMap::new());
+
+fn namespace() -> io::Result<Namespace> {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        use std::os::fd::AsRawFd;
+        // Linux UAPI asm-generic/socket.h and arch/sparc/include/uapi/asm/socket.h.
+        let option = if cfg!(any(target_arch = "sparc", target_arch = "sparc64")) {
+            0x0050
+        } else {
+            71
+        };
+        let socket = Socket::new(Domain::IPV6, Type::DGRAM, Some(Protocol::UDP))?;
+        let mut cookie = 0u64;
+        let mut length = std::mem::size_of_val(&cookie) as libc::socklen_t;
+        // net/core/sock.c sock_getsockopt(SO_NETNS_COOKIE) returns the socket
+        // namespace's u64 identity without procfs or privileges. The writable
+        // buffer has exactly that size.
+        if unsafe {
+            libc::getsockopt(
+                socket.as_raw_fd(),
+                libc::SOL_SOCKET,
+                option,
+                (&mut cookie as *mut u64).cast(),
+                &mut length,
+            )
+        } < 0
+        {
+            let error = io::Error::last_os_error();
+            if error.raw_os_error() != Some(libc::ENOPROTOOPT) {
+                return Err(error);
+            }
+            use std::os::unix::fs::MetadataExt;
+            let namespace = std::fs::metadata("/proc/thread-self/ns/net")?;
+            return Ok(Namespace::Inode(namespace.dev(), namespace.ino()));
+        }
+        Ok(Namespace::Cookie(cookie))
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    Ok(Namespace::Native)
+}
 
 /// A UDP socket on port 546, tied to `interface` if it exists.
 fn open_socket(interface: &str) -> io::Result<(Arc<UdpSocket>, Option<u32>)> {
@@ -250,26 +308,35 @@ fn open_socket(interface: &str) -> io::Result<(Arc<UdpSocket>, Option<u32>)> {
 impl Listener {
     /// The listener for `interface`, binding port 546 if no client there holds one yet.
     fn get(interface: &str) -> io::Result<Arc<Self>> {
+        let namespace = namespace()?;
         let mut listeners = LISTENERS.lock().unwrap_or_else(PoisonError::into_inner);
-        listeners.retain(|(_, weak)| weak.strong_count() > 0);
         if let Some(listener) = listeners
-            .iter()
-            .find(|(name, _)| name == interface)
-            .and_then(|(_, weak)| weak.upgrade())
+            .get(&namespace)
+            .and_then(|interfaces| interfaces.get(interface))
+            .and_then(Weak::upgrade)
         {
             return Ok(listener);
         }
 
         let listener = Arc::new(Self {
+            namespace,
             interface: interface.into(),
             socket: Mutex::new(open_socket(interface)?),
             clients: Mutex::default(),
         });
         let weak = Arc::downgrade(&listener);
-        std::thread::Builder::new()
+        if let Err(error) = std::thread::Builder::new()
             .name("iphost-dhcpv6-rx".into())
-            .spawn(move || Self::receive(&weak))?;
-        listeners.push((interface.into(), Arc::downgrade(&listener)));
+            .spawn(move || Self::receive(&weak))
+        {
+            // Listener::drop takes this lock even if construction failed.
+            drop(listeners);
+            return Err(error);
+        }
+        listeners
+            .entry(namespace)
+            .or_default()
+            .insert(interface.into(), Arc::downgrade(&listener));
         Ok(listener)
     }
 
@@ -330,6 +397,24 @@ impl Listener {
                     tracing::warn!(error = %_e, "DHCPv6 receive failed");
                     std::thread::sleep(RECV_TIMEOUT);
                 }
+            }
+        }
+    }
+}
+
+impl Drop for Listener {
+    fn drop(&mut self) {
+        let mut listeners = LISTENERS.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(interfaces) = listeners.get_mut(&self.namespace) {
+            // A new listener may have replaced our expired weak reference.
+            if interfaces
+                .get(&self.interface)
+                .is_some_and(|weak| std::ptr::eq(weak.as_ptr(), self))
+            {
+                interfaces.remove(&self.interface);
+            }
+            if interfaces.is_empty() {
+                listeners.remove(&self.namespace);
             }
         }
     }
@@ -494,6 +579,167 @@ fn parse_reply(msg: &[u8], xid: [u8; 3], duid: Option<&[u8]>) -> Option<Reply> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    fn refuse_syscalls(syscalls: &[libc::c_long], errno: i32) {
+        let mut filter = vec![libc::sock_filter {
+            code: 0x20,
+            jt: 0,
+            jf: 0,
+            k: 0,
+        }];
+        for syscall in syscalls {
+            filter.push(libc::sock_filter {
+                code: 0x15,
+                jt: 0,
+                jf: 1,
+                k: *syscall as u32,
+            });
+            filter.push(libc::sock_filter {
+                code: 0x06,
+                jt: 0,
+                jf: 0,
+                k: 0x00050000 | errno as u32,
+            });
+        }
+        filter.push(libc::sock_filter {
+            code: 0x06,
+            jt: 0,
+            jf: 0,
+            k: 0x7fff0000,
+        });
+        let program = libc::sock_fprog {
+            len: filter.len() as u16,
+            filter: filter.as_mut_ptr(),
+        };
+        // The kernel copies this filter; only this test thread and its children inherit it.
+        unsafe {
+            assert_eq!(
+                libc::prctl(
+                    libc::PR_SET_NO_NEW_PRIVS,
+                    1 as libc::c_ulong,
+                    0 as libc::c_ulong,
+                    0 as libc::c_ulong,
+                    0 as libc::c_ulong
+                ),
+                0
+            );
+            assert_eq!(
+                libc::prctl(
+                    libc::PR_SET_SECCOMP,
+                    2 as libc::c_ulong,
+                    &program as *const _,
+                    0 as libc::c_ulong,
+                    0 as libc::c_ulong
+                ),
+                0
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "isolated container with CAP_SYS_ADMIN and CAP_NET_RAW"]
+    fn receiver_spawn_failure_releases_cache_lock_and_socket() {
+        assert_eq!(unsafe { libc::unshare(libc::CLONE_NEWNET) }, 0);
+        let ns = namespace().unwrap();
+        refuse_syscalls(&[libc::SYS_clone, libc::SYS_clone3], libc::EAGAIN);
+        for _ in 0..3 {
+            match Listener::get("lo") {
+                Err(error) => assert_eq!(error.raw_os_error(), Some(libc::EAGAIN)),
+                Ok(_) => panic!("receiver thread unexpectedly started"),
+            }
+            assert!(!LISTENERS.lock().unwrap().contains_key(&ns));
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "isolated container with CAP_SYS_CHROOT and CAP_SYS_ADMIN"]
+    fn namespace_cookie_needs_no_procfs() {
+        let directory = std::env::temp_dir().join(format!("iphost-no-proc-{}", std::process::id()));
+        std::fs::create_dir(&directory).unwrap();
+        let root = std::ffi::CString::new(directory.as_os_str().as_encoded_bytes()).unwrap();
+        std::thread::spawn(move || {
+            // Isolate this thread's root and network namespace before chroot.
+            assert_eq!(
+                unsafe { libc::unshare(libc::CLONE_NEWNET | libc::CLONE_FS) },
+                0
+            );
+            assert_eq!(unsafe { libc::chroot(root.as_ptr()) }, 0);
+            std::env::set_current_dir("/").unwrap();
+            assert!(!std::path::Path::new("/proc").exists());
+            assert!(matches!(namespace().unwrap(), Namespace::Cookie(_)));
+            let listener = Listener::get("lo").unwrap();
+            assert!(Arc::ptr_eq(&listener, &Listener::get("lo").unwrap()));
+        })
+        .join()
+        .unwrap();
+        std::fs::remove_dir(directory).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "isolated container with CAP_SYS_ADMIN and CAP_NET_RAW"]
+    fn unsupported_namespace_cookie_uses_namespace_inode() {
+        let get = || {
+            std::thread::spawn(|| {
+                assert_eq!(unsafe { libc::unshare(libc::CLONE_NEWNET) }, 0);
+                refuse_syscalls(&[libc::SYS_getsockopt], libc::ENOPROTOOPT);
+                assert!(matches!(namespace().unwrap(), Namespace::Inode(_, _)));
+                let listener = Listener::get("lo").unwrap();
+                assert!(Arc::ptr_eq(&listener, &Listener::get("lo").unwrap()));
+                listener
+            })
+            .join()
+            .unwrap()
+        };
+        let first = get();
+        let second = get();
+        assert!(!Arc::ptr_eq(&first, &second));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "isolated container with CAP_SYS_ADMIN and CAP_NET_RAW"]
+    fn dropped_listeners_release_cache_records() {
+        assert_eq!(unsafe { libc::unshare(libc::CLONE_NEWNET) }, 0);
+        let listener = Listener::get("lo").unwrap();
+        let weak = Arc::downgrade(&listener);
+        drop(listener);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !LISTENERS.lock().unwrap().is_empty() && Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        assert_eq!(weak.strong_count(), 0);
+        assert!(
+            LISTENERS.lock().unwrap().is_empty(),
+            "dead listener still occupies the global cache"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "isolated container with CAP_SYS_ADMIN and CAP_NET_RAW"]
+    fn same_named_interfaces_share_only_within_their_network_namespace() {
+        let get = || {
+            std::thread::spawn(|| {
+                // This test thread and its listener stay in their disposable netns.
+                assert_eq!(unsafe { libc::unshare(libc::CLONE_NEWNET) }, 0);
+                let listener = Listener::get("lo").unwrap();
+                assert!(Arc::ptr_eq(&listener, &Listener::get("lo").unwrap()));
+                listener
+            })
+            .join()
+            .unwrap()
+        };
+        let first = get();
+        let second = get();
+        assert!(
+            !Arc::ptr_eq(&first, &second),
+            "reused another network namespace's DHCPv6 listener"
+        );
+    }
 
     const XID: [u8; 3] = [1, 2, 3];
     const DNS1: Ipv6Addr = Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 0x53);

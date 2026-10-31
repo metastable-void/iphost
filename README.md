@@ -37,6 +37,13 @@ Replacing the hostname or the resolver resets the cache. A lookup still in fligh
 
 `Ipv6ResolverConfig::with_failure_fallback(true)` opts into trying RA servers when DHCPv6 DNS fails. The default still selects only DHCPv6's nonempty list, or RA if DHCPv6 has none. With fallback enabled, A and AAAA independently exhaust the DHCPv6 list before trying RA; positive answers, NXDOMAIN, and NOERROR/NODATA settle that family. Each lookup starts with DHCPv6 again. `nameservers()` still returns the preferred list; the source accessors expose each source's list. Discovery waits up to three seconds once, and snapshots up to three servers per source. The lookup bound is 63 seconds when both sources started and fallback is enabled, otherwise 33 seconds. Cache options, binding, link-local scope and VRF/routing-domain support are unchanged.
 
+DHCPv6 configurations share their receive socket only within the same
+network namespace and interface. Linux and Android identify the namespace
+with `SO_NETNS_COOKIE`; older kernels without that option need readable
+`/proc/thread-self/ns/net`. No additional privilege or procfs access is
+needed when the socket option is available. Other platforms retain their
+existing interface-based sharing.
+
 ## Built-in stub client
 
 The `custom`, `ra` and `dhcpv6` resolvers share a minimal stub client (RFC 1035):
