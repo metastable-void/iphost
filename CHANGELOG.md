@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.4.3 (2026-10-31)
+
+- Bound each DHCPv6 client's pending datagrams to a 64-entry FIFO. Excess
+  incoming datagrams are dropped for that client without blocking other
+  clients; DHCPv6 retransmission and packet validation are unchanged.
+- Remove closed client subscriptions when their receivers drop, including
+  failed client-thread creation. Previously they remained in the listener
+  until another datagram arrived, retaining configuration history.
+- Add regressions for stalled and active clients, queue ordering and
+  recovery, subscriber history, real discovery-client cleanup and thread
+  creation failure. No public signature or dependency changes.
+
 ## 0.4.2 (2026-10-31)
 
 - Scope shared DHCPv6 listeners to their network namespace on Linux and

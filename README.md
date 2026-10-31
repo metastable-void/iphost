@@ -44,6 +44,13 @@ with `SO_NETNS_COOKIE`; older kernels without that option need readable
 needed when the socket option is available. Other platforms retain their
 existing interface-based sharing.
 
+Each DHCPv6 client has a FIFO of at most 64 pending datagrams. Incoming
+datagrams are dropped when that client's FIFO is full; other clients keep
+receiving, and RFC 8415 retransmission is unchanged. Dropping a client's
+receiver releases its queue and subscription immediately. This bounds
+userspace buffering by active clients rather than traffic or configuration
+history; kernel socket buffers and the current packet are separate bounds.
+
 ## Built-in stub client
 
 The `custom`, `ra` and `dhcpv6` resolvers share a minimal stub client (RFC 1035):

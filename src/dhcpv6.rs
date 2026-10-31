@@ -88,6 +88,10 @@ impl Dhcpv6ResolverConfig {
     /// interface; any number of configs can use the same interface. Binding port 546 needs
     /// privileges on most platforms (e.g. `CAP_NET_BIND_SERVICE` on Linux). The socket is
     /// closed when the last config on the interface is dropped.
+    /// Each client buffers at most 64 pending datagrams. A full client queue
+    /// drops incoming datagrams without delaying other clients; normal DHCPv6
+    /// retransmission still applies. Dropped clients release their queue and
+    /// subscription without waiting for another packet.
     /// On Linux and Android, namespace identity uses `SO_NETNS_COOKIE`; older
     /// kernels without that option need readable `/proc/thread-self/ns/net`.
     ///
@@ -194,6 +198,27 @@ impl Shared {
 
 /// A datagram received on the listener's interface.
 type Datagram = Vec<u8>;
+const PENDING_CAPACITY: usize = 64;
+type Clients = BTreeMap<u64, mpsc::SyncSender<Datagram>>;
+
+struct Replies {
+    listener: Arc<Listener>,
+    id: u64,
+    receiver: mpsc::Receiver<Datagram>,
+}
+
+impl std::ops::Deref for Replies {
+    type Target = mpsc::Receiver<Datagram>;
+    fn deref(&self) -> &Self::Target {
+        &self.receiver
+    }
+}
+
+impl Drop for Replies {
+    fn drop(&mut self) {
+        self.listener.clients().remove(&self.id);
+    }
+}
 
 /// Whether tying a socket to an interface also limits what it receives to that interface.
 const TIED_RECEIVE: bool = cfg!(any(
@@ -234,7 +259,7 @@ struct Listener {
     interface: String,
     /// The socket, and the interface index it is tied to (`None` while the interface is absent).
     socket: Mutex<(Arc<UdpSocket>, Option<u32>)>,
-    clients: Mutex<Vec<mpsc::Sender<Datagram>>>,
+    clients: Mutex<Clients>,
 }
 
 /// Distinguishes equally named interfaces in separate network namespaces.
@@ -365,14 +390,29 @@ impl Listener {
         }
     }
 
-    fn clients(&self) -> MutexGuard<'_, Vec<mpsc::Sender<Datagram>>> {
+    fn clients(&self) -> MutexGuard<'_, Clients> {
         self.clients.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    fn subscribe(&self) -> mpsc::Receiver<Datagram> {
-        let (tx, rx) = mpsc::channel();
-        self.clients().push(tx);
-        rx
+    fn subscribe(self: &Arc<Self>) -> Replies {
+        let (tx, receiver) = mpsc::sync_channel(PENDING_CAPACITY);
+        let mut clients = self.clients();
+        let id = clients.last_key_value().map_or(0, |(id, _)| id + 1);
+        clients.insert(id, tx);
+        Replies {
+            listener: self.clone(),
+            id,
+            receiver,
+        }
+    }
+
+    fn publish(&self, bytes: &[u8]) {
+        self.clients().retain(|_, tx| {
+            matches!(
+                tx.try_send(bytes.to_vec()),
+                Ok(()) | Err(mpsc::TrySendError::Full(_))
+            )
+        });
     }
 
     /// Hands every datagram from the interface to every client, until no client holds the listener.
@@ -382,10 +422,7 @@ impl Listener {
             listener.follow_interface();
             let (socket, index) = listener.current();
             match socket.recv_from(&mut buf) {
-                Ok((len, src)) if arrived_on(src, index) => listener
-                    .clients()
-                    // Dropped clients are forgotten here.
-                    .retain(|tx| tx.send(buf[..len].to_vec()).is_ok()),
+                Ok((len, src)) if arrived_on(src, index) => listener.publish(&buf[..len]),
                 Ok(_) => {}
                 Err(e)
                     if matches!(
@@ -434,7 +471,7 @@ fn jitter(duration: Duration) -> Duration {
 
 fn run(
     listener: &Listener,
-    replies: &mpsc::Receiver<Datagram>,
+    replies: &Replies,
     interface: &str,
     duid: Option<&[u8]>,
     shared: &Weak<Shared>,
@@ -579,6 +616,104 @@ fn parse_reply(msg: &[u8], xid: [u8; 3], duid: Option<&[u8]>) -> Option<Reply> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "isolated container with CAP_SYS_ADMIN and CAP_NET_RAW"]
+    fn removed_subscriptions_do_not_wait_for_another_packet() {
+        assert_eq!(unsafe { libc::unshare(libc::CLONE_NEWNET) }, 0);
+        let listener = Listener::get("lo").unwrap();
+        let survivor = listener.subscribe();
+        for _ in 0..1000 {
+            drop(listener.subscribe());
+        }
+        assert_eq!(
+            listener.clients().len(),
+            1,
+            "closed subscribers are cached by history"
+        );
+        listener.publish(b"survivor");
+        assert_eq!(
+            survivor.recv_timeout(Duration::from_secs(1)).unwrap(),
+            b"survivor"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "isolated container with CAP_SYS_ADMIN and CAP_NET_RAW"]
+    fn stalled_subscriber_has_a_bounded_fifo() {
+        assert_eq!(unsafe { libc::unshare(libc::CLONE_NEWNET) }, 0);
+        let listener = Listener::get("lo").unwrap();
+        let receiver = listener.subscribe();
+        let active = listener.subscribe();
+        for id in 0..1024u32 {
+            listener.publish(&id.to_be_bytes());
+            assert_eq!(
+                active.recv_timeout(Duration::from_secs(1)).unwrap(),
+                id.to_be_bytes()
+            );
+        }
+        let received = receiver.try_iter().collect::<Vec<_>>();
+        assert_eq!(
+            received.len(),
+            64,
+            "a stalled subscriber retained the entire packet history"
+        );
+        for (id, packet) in received.iter().enumerate() {
+            assert_eq!(*packet, (id as u32).to_be_bytes());
+        }
+        listener.publish(b"after draining");
+        assert_eq!(
+            receiver.recv_timeout(Duration::from_secs(1)).unwrap(),
+            b"after draining"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "isolated container with CAP_SYS_ADMIN and CAP_NET_RAW"]
+    fn completed_discovery_clients_release_subscriptions_while_another_stays() {
+        assert_eq!(unsafe { libc::unshare(libc::CLONE_NEWNET) }, 0);
+        let survivor = Dhcpv6ResolverConfig::new("lo", ClientId::None).unwrap();
+        let listener = Listener::get("lo").unwrap();
+        for epoch in 0..4 {
+            let configs = (0..32)
+                .map(|_| Dhcpv6ResolverConfig::new("lo", ClientId::None).unwrap())
+                .collect::<Vec<_>>();
+            let snapshots = configs
+                .iter()
+                .map(|config| Arc::downgrade(&config.shared))
+                .collect::<Vec<_>>();
+            drop(configs);
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while listener.clients().len() != 1 && Instant::now() < deadline {
+                std::thread::yield_now();
+            }
+            assert_eq!(listener.clients().len(), 1);
+            assert!(
+                snapshots
+                    .iter()
+                    .all(|snapshot| snapshot.strong_count() == 0)
+            );
+            assert!(survivor.nameservers().is_empty());
+            eprintln!("DHCP_CLIENT_HISTORY epoch={epoch} removed=32 subscribers=1");
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "isolated container with CAP_SYS_ADMIN and CAP_NET_RAW"]
+    fn client_spawn_failure_removes_its_subscription() {
+        assert_eq!(unsafe { libc::unshare(libc::CLONE_NEWNET) }, 0);
+        let listener = Listener::get("lo").unwrap();
+        refuse_syscalls(&[libc::SYS_clone, libc::SYS_clone3], libc::EAGAIN);
+        for _ in 0..3 {
+            let error = Dhcpv6ResolverConfig::new("lo", ClientId::None).unwrap_err();
+            assert_eq!(error.raw_os_error(), Some(libc::EAGAIN));
+            assert!(listener.clients().is_empty());
+        }
+    }
 
     #[cfg(target_os = "linux")]
     fn refuse_syscalls(syscalls: &[libc::c_long], errno: i32) {
